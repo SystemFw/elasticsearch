@@ -27,6 +27,7 @@ import org.elasticsearch.action.support.ThreadedActionListener;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.routing.RecoverySource;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.elasticsearch.cluster.routing.allocation.WriteLoadConstraintSettings;
@@ -98,6 +99,9 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
         Property.NodeScope
     );
 
+    private final boolean stateless;
+    // Written by the cluster-applier thread and read by asynchronous refreshes.
+    private volatile boolean snapshotRestoreStatsRequired;
     private volatile boolean diskThresholdEnabled;
     private volatile boolean estimatedHeapThresholdEnabled;
     private volatile WriteLoadDeciderStatus writeLoadConstraintEnabled;
@@ -135,6 +139,7 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
         PartitionSizeCollector partitionSizeCollector,
         NodeUsageStatsForThreadPoolsCollector nodeUsageStatsForThreadPoolsCollector
     ) {
+        this.stateless = DiscoveryNode.isStateless(settings);
         this.threadPool = threadPool;
         this.client = client;
         this.estimatedHeapUsageCollector = estimatedHeapUsageCollector;
@@ -190,6 +195,21 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
 
     @Override
     public void clusterChanged(ClusterChangedEvent event) {
+        final boolean restoreStatsRequired = stateless
+            && event.localNodeMaster()
+            && event.state()
+                .globalRoutingTable()
+                .routingTables()
+                .values()
+                .stream()
+                .flatMap(table -> table.allShards())
+                .anyMatch(
+                    shard -> shard.primary()
+                        && (shard.unassigned() || shard.initializing())
+                        && shard.recoverySource().getType() == RecoverySource.Type.SNAPSHOT
+                );
+        final boolean startRestoreCollection = restoreStatsRequired && snapshotRestoreStatsRequired == false;
+        snapshotRestoreStatsRequired = restoreStatsRequired;
         final Runnable newRefresh;
         synchronized (mutex) {
             if (event.localNodeMaster() == false) {
@@ -201,6 +221,9 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
                 logger.trace("elected as master, scheduling cluster info update tasks");
                 refreshScheduler = new RefreshScheduler();
                 nextRefreshListeners.add(refreshScheduler.getListener());
+            }
+            if (startRestoreCollection) {
+                nextRefreshListeners.add(ActionListener.noop());
             }
             newRefresh = getNewRefresh();
             assert assertRefreshInvariant();
@@ -229,6 +252,8 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
         private volatile Map<String, Long> hostedShardsPartitionSizeByNodeId = Map.of();
         private volatile IndicesStatsSummary indicesStatsSummary;
 
+        private final boolean collectStoreStats = diskThresholdEnabled || snapshotRestoreStatsRequired;
+        private final boolean collectNodeStats = diskThresholdEnabled || estimatedHeapThresholdEnabled || snapshotRestoreStatsRequired;
         private final List<ActionListener<ClusterInfo>> thisRefreshListeners;
         private final RefCountingRunnable fetchRefs = new RefCountingRunnable(this::callListeners);
 
@@ -240,8 +265,8 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
             logger.trace("starting async refresh");
 
             try (var ignoredRefs = fetchRefs) {
-                maybeFetchIndicesStats(diskThresholdEnabled || writeLoadConstraintEnabled.atLeastLowThresholdEnabled());
-                maybeFetchNodeStats(diskThresholdEnabled || estimatedHeapThresholdEnabled);
+                maybeFetchIndicesStats(collectStoreStats || writeLoadConstraintEnabled.atLeastLowThresholdEnabled());
+                maybeFetchNodeStats(collectNodeStats);
                 maybeFetchEstimatedHeapUsage(estimatedHeapThresholdEnabled);
                 fetchNodesUsageStatsForThreadPools();
                 fetchCacheUsageAndCommitments();
@@ -381,7 +406,7 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
         private void fetchIndicesStats() {
             final IndicesStatsRequest indicesStatsRequest = new IndicesStatsRequest();
             indicesStatsRequest.clear();
-            if (diskThresholdEnabled) {
+            if (collectStoreStats) {
                 // This returns the shard sizes on disk
                 indicesStatsRequest.store(true);
             }

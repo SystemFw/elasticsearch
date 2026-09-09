@@ -143,6 +143,8 @@ import org.elasticsearch.xpack.stateless.allocation.StatelessExistingShardsAlloc
 import org.elasticsearch.xpack.stateless.allocation.StatelessIndexSettingProvider;
 import org.elasticsearch.xpack.stateless.allocation.StatelessShardRelocationOrder;
 import org.elasticsearch.xpack.stateless.allocation.StatelessShardRoutingRoleStrategy;
+import org.elasticsearch.xpack.stateless.allocation.StatelessSnapshotRestoreAllocationDecider;
+import org.elasticsearch.xpack.stateless.allocation.StatelessSnapshotRestoreStorageMonitor;
 import org.elasticsearch.xpack.stateless.allocation.StatelessThrottlingConcurrentRecoveriesAllocationDecider;
 import org.elasticsearch.xpack.stateless.cache.DefaultWarmingRatioProviderFactory;
 import org.elasticsearch.xpack.stateless.cache.PinnedWindowEvictionPolicy;
@@ -967,6 +969,10 @@ public class StatelessPlugin extends Plugin
                     rerouteService
                 )::onNewInfo
             );
+
+        services.allocationService()
+            .getClusterInfoService()
+            .addListener(new StatelessSnapshotRestoreStorageMonitor(clusterService::state, rerouteService)::onNewInfo);
 
         recoveryCommitRegistrationHandler.set(new RecoveryCommitRegistrationHandler(client, clusterService));
 
@@ -1952,6 +1958,7 @@ public class StatelessPlugin extends Plugin
         return List.of(
             new DisableSimulationRebalancingDecider(clusterSettings),
             new StatelessAllocationDecider(),
+            new StatelessSnapshotRestoreAllocationDecider(),
             new EstimatedHeapUsageAllocationDecider(estimatedHeapSettings.get(), clusterSettings),
             new SharedCacheCapacityAllocationDecider(clusterSettings),
             new StatelessThrottlingConcurrentRecoveriesAllocationDecider(clusterSettings)
