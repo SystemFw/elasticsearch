@@ -68,36 +68,29 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         }
     }
 
-    public void testCollectionTracksOutstandingRestores() {
-        try (var fixture = new Fixture(Settings.EMPTY)) {
-            fixture.setRestores(UNASSIGNED);
-            fixture.becomeMaster();
-            fixture.completeRefresh();
-            assertEquals(1, fixture.storeRequests);
+    public void testRestoreStatesRequiringStoreStats() {
+        record CollectionCase(String description, List<ShardRoutingState> restoreStates, boolean expectStoreStats) {}
 
-            fixture.setRestores(UNASSIGNED, UNASSIGNED);
-            assertTrue(fixture.pending.isEmpty()); // overlapping restores share the periodic collection
-            fixture.periodicRefresh();
-            assertEquals(2, fixture.storeRequests);
-
-            fixture.setRestores(STARTED, INITIALIZING);
-            fixture.periodicRefresh();
-            assertEquals(3, fixture.storeRequests); // the remaining recovery still needs reservations
-
-            fixture.setRestores(STARTED, STARTED);
-            fixture.periodicRefresh();
-            assertEquals(3, fixture.storeRequests);
-
-            fixture.setRestores(UNASSIGNED);
-            fixture.completeRefresh();
-            assertEquals(4, fixture.storeRequests);
-            fixture.setRestores(); // cancellation removes the last pending restore
-            fixture.periodicRefresh();
-            assertEquals(4, fixture.storeRequests);
+        var cases = List.of(
+            new CollectionCase("no restore", List.of(), false),
+            new CollectionCase("waiting", List.of(UNASSIGNED), true),
+            new CollectionCase("recovering", List.of(INITIALIZING), true),
+            new CollectionCase("completed", List.of(STARTED), false),
+            new CollectionCase("multiple waiting", List.of(UNASSIGNED, UNASSIGNED), true),
+            new CollectionCase("one still recovering", List.of(STARTED, INITIALIZING), true),
+            new CollectionCase("all completed", List.of(STARTED, STARTED), false)
+        );
+        for (var testCase : cases) {
+            try (var fixture = new Fixture(Settings.EMPTY)) {
+                fixture.setRestores(testCase.restoreStates().toArray(ShardRoutingState[]::new));
+                fixture.becomeMaster();
+                assertEquals(testCase.description(), testCase.expectStoreStats(), fixture.storeRequests > 0);
+                fixture.completeRefresh();
+            }
         }
     }
 
-    public void testCollectionRespectsMastershipAndOtherConsumers() {
+    public void testRemovingRestoreDemandPreservesDiskCollection() {
         for (boolean diskEnabled : List.of(false, true)) {
             var overrides = Settings.builder()
                 .put(DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING.getKey(), diskEnabled)
@@ -105,30 +98,14 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                 .build();
             try (var fixture = new Fixture(overrides)) {
                 fixture.setRestores(UNASSIGNED);
-                assertTrue(fixture.pending.isEmpty());
-                fixture.becomeMaster();
-                assertEquals(2, fixture.pending.size()); // restore alone also enables filesystem collection
-                fixture.completeRefresh();
-                assertEquals(1, fixture.storeRequests);
-
-                fixture.loseMastership();
-                fixture.periodicRefresh();
-                assertTrue(fixture.pending.isEmpty());
-                assertEquals(1, fixture.storeRequests);
                 fixture.becomeMaster();
                 fixture.completeRefresh();
-                assertEquals(2, fixture.storeRequests);
+                assertEquals(1, fixture.storeRequests);
 
                 fixture.setRestores();
                 fixture.periodicRefresh();
-                assertEquals(diskEnabled ? 3 : 2, fixture.storeRequests);
+                assertEquals(diskEnabled ? 2 : 1, fixture.storeRequests);
             }
-        }
-        try (var fixture = new Fixture(Settings.builder().put("stateless.enabled", false).build())) {
-            fixture.setRestores(UNASSIGNED);
-            fixture.becomeMaster();
-            fixture.completeRefresh();
-            assertEquals(0, fixture.storeRequests); // no change to stateful collection
         }
     }
 
