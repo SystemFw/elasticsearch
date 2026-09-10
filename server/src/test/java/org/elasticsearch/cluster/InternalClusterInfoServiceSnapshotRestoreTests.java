@@ -54,7 +54,6 @@ import static org.elasticsearch.cluster.routing.ShardRoutingState.UNASSIGNED;
 public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
     public void testRestoreActivationDuringRefreshQueuesStoreCollection() {
         try (var fixture = new Fixture(Settings.EMPTY)) {
-            fixture.becomeMaster();
             assertEquals(1, fixture.pending.size()); // the existing heap consumer requests node stats
 
             fixture.setRestores(UNASSIGNED);
@@ -82,8 +81,8 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         );
         for (var testCase : cases) {
             try (var fixture = new Fixture(Settings.EMPTY)) {
+                fixture.completeRefresh();
                 fixture.setRestores(testCase.restoreStates().toArray(ShardRoutingState[]::new));
-                fixture.becomeMaster();
                 assertEquals(testCase.description(), testCase.expectStoreStats(), fixture.storeRequests > 0);
                 fixture.completeRefresh();
             }
@@ -97,14 +96,15 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                 .put(InternalClusterInfoService.CLUSTER_ROUTING_ALLOCATION_ESTIMATED_HEAP_THRESHOLD_DECIDER_ENABLED.getKey(), false)
                 .build();
             try (var fixture = new Fixture(overrides)) {
-                fixture.setRestores(UNASSIGNED);
-                fixture.becomeMaster();
                 fixture.completeRefresh();
-                assertEquals(1, fixture.storeRequests);
+                int initialStoreRequests = fixture.storeRequests;
+                fixture.setRestores(UNASSIGNED);
+                fixture.completeRefresh();
+                assertEquals(initialStoreRequests + 1, fixture.storeRequests);
 
                 fixture.setRestores();
                 fixture.periodicRefresh();
-                assertEquals(diskEnabled ? 2 : 1, fixture.storeRequests);
+                assertEquals(initialStoreRequests + (diskEnabled ? 2 : 1), fixture.storeRequests);
             }
         }
     }
@@ -163,14 +163,7 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                 NodeUsageStatsForThreadPoolsCollector.EMPTY
             );
             service.addListener(ignored -> {});
-        }
-
-        void becomeMaster() {
             update(ClusterState.builder(state).nodes(DiscoveryNodes.builder(state.nodes()).masterNodeId(node.getId())).build());
-        }
-
-        void loseMastership() {
-            update(ClusterState.builder(state).nodes(DiscoveryNodes.builder(state.nodes()).masterNodeId(null)).build());
         }
 
         // Supply just the routing states the collector observes, without simulating a restore workflow.
@@ -226,7 +219,7 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
 
         @Override
         public void close() {
-            loseMastership();
+            update(ClusterState.builder(state).nodes(DiscoveryNodes.builder(state.nodes()).masterNodeId(null)).build());
             while (pending.isEmpty() == false) {
                 completeRefresh();
             }
