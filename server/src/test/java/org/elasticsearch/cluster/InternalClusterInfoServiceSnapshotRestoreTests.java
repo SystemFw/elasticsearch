@@ -50,7 +50,7 @@ import static org.mockito.Mockito.when;
 /** Exercises the extra collection demand from snapshot restores, independently of allocation and recovery. */
 public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
     public void testRestoreActivationDuringRefreshQueuesStoreCollection() {
-        var fixture = new Fixture(Settings.EMPTY);
+        var fixture = new Fixture(CollectionMode.HEAP);
         fixture.startRefresh();
 
         fixture.setRestores(UNASSIGNED);
@@ -73,10 +73,7 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
             new CollectionCase("all completed", List.of(STARTED, STARTED), 0)
         );
         for (var testCase : cases) {
-            var overrides = Settings.builder()
-                .put(InternalClusterInfoService.CLUSTER_ROUTING_ALLOCATION_ESTIMATED_HEAP_THRESHOLD_DECIDER_ENABLED.getKey(), false)
-                .build();
-            var fixture = new Fixture(overrides);
+            var fixture = new Fixture(CollectionMode.NONE);
             fixture.setRestores(testCase.restoreStates().toArray(ShardRoutingState[]::new));
             assertEquals(testCase.description(), testCase.expectedRequests(), fixture.storeRequests);
             assertEquals(testCase.description(), testCase.expectedRequests(), fixture.nodeStatsRequests);
@@ -84,29 +81,42 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         }
     }
 
-    public void testRemovingRestoreDemandPreservesDiskCollection() {
-        for (boolean diskEnabled : List.of(false, true)) {
-            var overrides = Settings.builder()
-                .put(DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING.getKey(), diskEnabled)
-                .put(InternalClusterInfoService.CLUSTER_ROUTING_ALLOCATION_ESTIMATED_HEAP_THRESHOLD_DECIDER_ENABLED.getKey(), false)
-                .build();
-            var fixture = new Fixture(overrides);
-            int initialStoreRequests = fixture.storeRequests;
-            int initialNodeStatsRequests = fixture.nodeStatsRequests;
-            if (diskEnabled == false) {
-                assertEquals(0, initialStoreRequests);
-                assertEquals(0, initialNodeStatsRequests);
-            }
-            fixture.setRestores(UNASSIGNED);
-            fixture.completeRefresh();
-            assertEquals(initialStoreRequests + 1, fixture.storeRequests);
-            assertEquals(initialNodeStatsRequests + 1, fixture.nodeStatsRequests);
+    public void testRemovingRestoreDemandStopsCollection() {
+        var fixture = new Fixture(CollectionMode.NONE);
+        assertEquals(0, fixture.storeRequests);
+        assertEquals(0, fixture.nodeStatsRequests);
 
-            fixture.setRestores();
-            fixture.periodicRefresh();
-            assertEquals(initialStoreRequests + (diskEnabled ? 2 : 1), fixture.storeRequests);
-            assertEquals(initialNodeStatsRequests + (diskEnabled ? 2 : 1), fixture.nodeStatsRequests);
-        }
+        fixture.setRestores(UNASSIGNED);
+        fixture.completeRefresh();
+        assertEquals(1, fixture.storeRequests);
+        assertEquals(1, fixture.nodeStatsRequests);
+
+        fixture.setRestores();
+        fixture.periodicRefresh();
+        assertEquals(1, fixture.storeRequests);
+        assertEquals(1, fixture.nodeStatsRequests);
+    }
+
+    public void testRemovingRestoreDemandPreservesDiskCollection() {
+        var fixture = new Fixture(CollectionMode.DISK);
+        assertEquals(1, fixture.storeRequests);
+        assertEquals(1, fixture.nodeStatsRequests);
+
+        fixture.setRestores(UNASSIGNED);
+        fixture.completeRefresh();
+        assertEquals(2, fixture.storeRequests);
+        assertEquals(2, fixture.nodeStatsRequests);
+
+        fixture.setRestores();
+        fixture.periodicRefresh();
+        assertEquals(3, fixture.storeRequests);
+        assertEquals(3, fixture.nodeStatsRequests);
+    }
+
+    private enum CollectionMode {
+        NONE,
+        HEAP,
+        DISK
     }
 
     private class Fixture {
@@ -119,16 +129,21 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         int storeRequests;
         int nodeStatsRequests;
 
-        Fixture(Settings overrides) {
+        Fixture(CollectionMode collectionMode) {
             var settings = Settings.builder()
                 .put("stateless.enabled", true)
-                .put(DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING.getKey(), false)
+                .put(
+                    DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING.getKey(),
+                    collectionMode == CollectionMode.DISK
+                )
                 .put(
                     WriteLoadConstraintSettings.WRITE_LOAD_DECIDER_ENABLED_SETTING.getKey(),
                     WriteLoadConstraintSettings.WriteLoadDeciderStatus.DISABLED
                 )
-                .put(InternalClusterInfoService.CLUSTER_ROUTING_ALLOCATION_ESTIMATED_HEAP_THRESHOLD_DECIDER_ENABLED.getKey(), true)
-                .put(overrides)
+                .put(
+                    InternalClusterInfoService.CLUSTER_ROUTING_ALLOCATION_ESTIMATED_HEAP_THRESHOLD_DECIDER_ENABLED.getKey(),
+                    collectionMode == CollectionMode.HEAP
+                )
                 .build();
             var clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
             // Only settings and state are needed; avoid starting cluster-service executors.
