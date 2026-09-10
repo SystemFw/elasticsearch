@@ -56,6 +56,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import static org.elasticsearch.cluster.routing.allocation.WriteLoadConstraintSettings.WRITE_LOAD_DECIDER_ENABLED_SETTING;
@@ -195,21 +196,20 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
 
     @Override
     public void clusterChanged(ClusterChangedEvent event) {
-        final boolean restoreStatsRequired = stateless
+        final Predicate<ClusterState> snaphotRestoreInProgress = state -> state.globalRoutingTable()
+            .routingTables()
+            .values()
+            .stream()
+            .flatMap(RoutingTable::allShards)
+            .anyMatch(
+                shard -> shard.primary()
+                    && (shard.unassigned() || shard.initializing())
+                    && shard.recoverySource().getType() == RecoverySource.Type.SNAPSHOT
+            );
+        snapshotRestoreStatsRequired = stateless
             && event.localNodeMaster()
-            && event.state()
-                .globalRoutingTable()
-                .routingTables()
-                .values()
-                .stream()
-                .flatMap(RoutingTable::allShards)
-                .anyMatch(
-                    shard -> shard.primary()
-                        && (shard.unassigned() || shard.initializing())
-                        && shard.recoverySource().getType() == RecoverySource.Type.SNAPSHOT
-                );
-        final boolean startRestoreCollection = restoreStatsRequired && snapshotRestoreStatsRequired == false;
-        snapshotRestoreStatsRequired = restoreStatsRequired;
+            && snaphotRestoreInProgress.test(event.previousState()) == false
+            && snaphotRestoreInProgress.test(event.state());
         final Runnable newRefresh;
         synchronized (mutex) {
             if (event.localNodeMaster() == false) {
@@ -222,7 +222,7 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
                 refreshScheduler = new RefreshScheduler();
                 nextRefreshListeners.add(refreshScheduler.getListener());
             }
-            if (startRestoreCollection) {
+            if (snapshotRestoreStatsRequired) {
                 // ensures a refresh happens when the stats need collecting, even if there's no other listener queued up
                 nextRefreshListeners.add(ActionListener.noop());
             }
