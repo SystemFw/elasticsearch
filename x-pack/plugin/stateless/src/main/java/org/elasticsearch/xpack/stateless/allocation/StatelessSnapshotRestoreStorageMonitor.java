@@ -29,7 +29,7 @@ public class StatelessSnapshotRestoreStorageMonitor {
     private final RerouteService rerouteService;
     // Accessed only by onNewInfo callbacks. InternalClusterInfoService serializes these callbacks and
     // safely publishes their writes through the synchronized refresh handoff, even when the callback thread changes.
-    private Map<String, Storage> previous = Map.of();
+    private Map<String, Storage> nodeStorage = Map.of();
 
     private record Storage(String path, long freeBytes, ClusterInfo.ReservedSpace reservations) {}
 
@@ -41,20 +41,23 @@ public class StatelessSnapshotRestoreStorageMonitor {
     public void onNewInfo(ClusterInfo info) {
         var state = clusterState.get();
         if (state.nodes().isLocalNodeElectedMaster() == false) {
-            previous = Map.of();
+            nodeStorage = Map.of();
             return;
         }
-        Map<String, Storage> current = new HashMap<>();
+        Map<String, Storage> nodeStorageNow = new HashMap<>();
         for (var node : state.nodes()) {
             if (node.getRoles().contains(DiscoveryNodeRole.INDEX_ROLE)) {
                 var disk = info.getNodeMostAvailableDiskUsages().get(node.getId());
                 if (disk != null) {
-                    current.put(node.getId(), new Storage(disk.path(), disk.freeBytes(), info.getReservedSpace(node.getId(), disk.path())));
+                    nodeStorageNow.put(
+                        node.getId(),
+                        new Storage(disk.path(), disk.freeBytes(), info.getReservedSpace(node.getId(), disk.path()))
+                    );
                 }
             }
         }
-        boolean changed = current.equals(previous) == false;
-        previous = Collections.unmodifiableMap(current);
+        boolean changed = nodeStorageNow.equals(nodeStorage) == false;
+        nodeStorage = Collections.unmodifiableMap(nodeStorageNow);
         if (changed
             && state.getRoutingNodes()
                 .unassigned()
