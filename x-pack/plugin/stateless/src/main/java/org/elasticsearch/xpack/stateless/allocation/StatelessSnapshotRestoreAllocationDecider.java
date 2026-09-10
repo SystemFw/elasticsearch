@@ -30,13 +30,20 @@ public class StatelessSnapshotRestoreAllocationDecider extends AllocationDecider
             || node.node().getRoles().contains(DiscoveryNodeRole.INDEX_ROLE) == false) {
             return Decision.YES;
         }
+        // Simulation cannot wait for external information. Prefer a node with known capacity, but allow a tentative
+        // target until information arrives. Reconciliation must wait: NO there can fail an API restore permanently.
+        // Alternative: when the snapshot size is unknown, StatelessExistingShardsAllocator could defer the whole shard
+        // before simulation with removeAndIgnore(NO_ATTEMPT), since no candidate can be evaluated without that size.
+        // InternalSnapshotsInfoService already requests a reroute when the size arrives; the next allocation round would
+        // then let the shard proceed. Candidate-specific disk information and capacity checks would remain in this decider.
+        Decision missingInformationDecision = allocation.isSimulating() ? Decision.NOT_PREFERRED : Decision.THROTTLE;
         Long size = allocation.snapshotShardSizeInfo().getShardSize(shard);
         if (size == null || size < 0) {
-            return allocation.decision(Decision.THROTTLE, NAME, "snapshot shard size is unavailable");
+            return allocation.decision(missingInformationDecision, NAME, "snapshot shard size is unavailable");
         }
         var disk = allocation.clusterInfo().getNodeMostAvailableDiskUsages().get(node.nodeId());
         if (disk == null) {
-            return allocation.decision(Decision.THROTTLE, NAME, "node disk information is unavailable");
+            return allocation.decision(missingInformationDecision, NAME, "node disk information is unavailable");
         }
         // Include recoveries assigned since the last stats refresh; never credit outgoing files before deletion.
         long committed = DiskThresholdDecider.sizeOfUnaccountedShards(
@@ -50,9 +57,11 @@ public class StatelessSnapshotRestoreAllocationDecider extends AllocationDecider
             allocation.unaccountedSearchableSnapshotSize(node)
         );
         long usable = disk.freeBytes() - committed;
+        // Reject undersized targets in simulation so a previous desired assignment can be reconsidered. During
+        // reconciliation, THROTTLE keeps the API restore pending rather than marking it failed.
         boolean fits = usable >= HEADROOM_BYTES && size <= usable - HEADROOM_BYTES;
         return allocation.decision(
-            fits ? Decision.YES : Decision.NO,
+            fits ? Decision.YES : allocation.isSimulating() ? Decision.NO : Decision.THROTTLE,
             NAME,
             "snapshot restore storage: free [%d] bytes, incoming commitments [%d] bytes, shard [%d] bytes, headroom [%d] bytes",
             disk.freeBytes(),
