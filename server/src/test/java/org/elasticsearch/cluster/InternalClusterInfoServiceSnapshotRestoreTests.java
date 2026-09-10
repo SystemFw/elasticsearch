@@ -63,8 +63,8 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         }
     }
 
-    public void testRestoreStatesRequiringStoreStats() {
-        record CollectionCase(String description, List<ShardRoutingState> restoreStates, boolean expectStoreStats) {}
+    public void testRestoreStatesRequiringStats() {
+        record CollectionCase(String description, List<ShardRoutingState> restoreStates, boolean expectStats) {}
 
         var cases = List.of(
             new CollectionCase("no restore", List.of(), false),
@@ -76,9 +76,13 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
             new CollectionCase("all completed", List.of(STARTED, STARTED), false)
         );
         for (var testCase : cases) {
-            try (var fixture = new Fixture(Settings.EMPTY)) {
+            var overrides = Settings.builder()
+                .put(InternalClusterInfoService.CLUSTER_ROUTING_ALLOCATION_ESTIMATED_HEAP_THRESHOLD_DECIDER_ENABLED.getKey(), false)
+                .build();
+            try (var fixture = new Fixture(overrides)) {
                 fixture.setRestores(testCase.restoreStates().toArray(ShardRoutingState[]::new));
-                assertEquals(testCase.description(), testCase.expectStoreStats(), fixture.storeRequests > 0);
+                assertEquals(testCase.description(), testCase.expectStats() ? 1 : 0, fixture.storeRequests);
+                assertEquals(testCase.description(), testCase.expectStats() ? 1 : 0, fixture.nodeStatsRequests);
                 fixture.completeRefresh();
             }
         }
@@ -92,13 +96,20 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                 .build();
             try (var fixture = new Fixture(overrides)) {
                 int initialStoreRequests = fixture.storeRequests;
+                int initialNodeStatsRequests = fixture.nodeStatsRequests;
+                if (diskEnabled == false) {
+                    assertEquals(0, initialStoreRequests);
+                    assertEquals(0, initialNodeStatsRequests);
+                }
                 fixture.setRestores(UNASSIGNED);
                 fixture.completeRefresh();
                 assertEquals(initialStoreRequests + 1, fixture.storeRequests);
+                assertEquals(initialNodeStatsRequests + 1, fixture.nodeStatsRequests);
 
                 fixture.setRestores();
                 fixture.periodicRefresh();
                 assertEquals(initialStoreRequests + (diskEnabled ? 2 : 1), fixture.storeRequests);
+                assertEquals(initialNodeStatsRequests + (diskEnabled ? 2 : 1), fixture.nodeStatsRequests);
             }
         }
     }
@@ -112,6 +123,7 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
             .nodes(DiscoveryNodes.builder().add(node).localNodeId(node.getId()))
             .build();
         int storeRequests;
+        int nodeStatsRequests;
 
         Fixture(Settings overrides) {
             var settings = Settings.builder()
@@ -134,11 +146,10 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                     Request request,
                     ActionListener<Response> listener
                 ) {
-                    if (request instanceof IndicesStatsRequest indices) {
-                        assertTrue(indices.store());
+                    if (request instanceof IndicesStatsRequest indices && indices.store()) {
                         storeRequests++;
-                    } else {
-                        assertTrue(request instanceof NodesStatsRequest);
+                    } else if (request instanceof NodesStatsRequest) {
+                        nodeStatsRequests++;
                     }
                     // As in InternalClusterInfoServiceSchedulingTests, finish without metrics using a failure the service handles quietly.
                     queue.scheduleNow(
