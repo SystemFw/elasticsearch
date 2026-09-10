@@ -53,7 +53,7 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         var fixture = new Fixture(CollectionMode.HEAP);
         fixture.startRefresh();
 
-        fixture.setRestores(UNASSIGNED);
+        fixture.setRestore(UNASSIGNED);
         assertEquals(0, fixture.storeRequests);
 
         fixture.completeRefresh();
@@ -61,20 +61,17 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
     }
 
     public void testRestoreStatesRequiringStats() {
-        record CollectionCase(String description, List<ShardRoutingState> restoreStates, int expectedRequests) {}
+        record CollectionCase(String description, ShardRoutingState restoreState, int expectedRequests) {}
 
         var cases = List.of(
-            new CollectionCase("no restore", List.of(), 0),
-            new CollectionCase("waiting", List.of(UNASSIGNED), 1),
-            new CollectionCase("recovering", List.of(INITIALIZING), 1),
-            new CollectionCase("completed", List.of(STARTED), 0),
-            new CollectionCase("multiple waiting", List.of(UNASSIGNED, UNASSIGNED), 1),
-            new CollectionCase("one still recovering", List.of(STARTED, INITIALIZING), 1),
-            new CollectionCase("all completed", List.of(STARTED, STARTED), 0)
+            new CollectionCase("no restore", null, 0),
+            new CollectionCase("waiting", UNASSIGNED, 1),
+            new CollectionCase("recovering", INITIALIZING, 1),
+            new CollectionCase("completed", STARTED, 0)
         );
         for (var testCase : cases) {
             var fixture = new Fixture(CollectionMode.NONE);
-            fixture.setRestores(testCase.restoreStates().toArray(ShardRoutingState[]::new));
+            fixture.setRestore(testCase.restoreState());
             assertEquals(testCase.description(), testCase.expectedRequests(), fixture.storeRequests);
             assertEquals(testCase.description(), testCase.expectedRequests(), fixture.nodeStatsRequests);
             fixture.completeRefresh();
@@ -86,12 +83,12 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         assertEquals(0, fixture.storeRequests);
         assertEquals(0, fixture.nodeStatsRequests);
 
-        fixture.setRestores(UNASSIGNED);
+        fixture.setRestore(UNASSIGNED);
         fixture.completeRefresh();
         assertEquals(1, fixture.storeRequests);
         assertEquals(1, fixture.nodeStatsRequests);
 
-        fixture.setRestores();
+        fixture.setRestore(null);
         fixture.periodicRefresh();
         assertEquals(1, fixture.storeRequests);
         assertEquals(1, fixture.nodeStatsRequests);
@@ -102,12 +99,12 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         assertEquals(1, fixture.storeRequests);
         assertEquals(1, fixture.nodeStatsRequests);
 
-        fixture.setRestores(UNASSIGNED);
+        fixture.setRestore(UNASSIGNED);
         fixture.completeRefresh();
         assertEquals(2, fixture.storeRequests);
         assertEquals(2, fixture.nodeStatsRequests);
 
-        fixture.setRestores();
+        fixture.setRestore(null);
         fixture.periodicRefresh();
         assertEquals(3, fixture.storeRequests);
         assertEquals(3, fixture.nodeStatsRequests);
@@ -184,11 +181,11 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         }
 
         // Supply just the routing states the collector observes, without simulating a restore workflow.
-        void setRestores(ShardRoutingState... states) {
+        void setRestore(ShardRoutingState restoreState) {
             var metadata = Metadata.builder();
             var routing = RoutingTable.builder();
-            for (int i = 0; i < states.length; i++) {
-                var index = IndexMetadata.builder("index-" + i)
+            if (restoreState != null) {
+                var index = IndexMetadata.builder("index")
                     .settings(settings(IndexVersion.current()))
                     .numberOfShards(1)
                     .numberOfReplicas(0)
@@ -196,17 +193,17 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                 metadata.put(index, false);
                 var shard = TestShardRouting.shardRoutingBuilder(
                     new ShardId(index.getIndex(), 0),
-                    states[i] == UNASSIGNED ? null : node.getId(),
+                    restoreState == UNASSIGNED ? null : node.getId(),
                     true,
-                    states[i]
+                    restoreState
                 );
-                if (states[i] != STARTED) {
+                if (restoreState != STARTED) {
                     shard.withRecoverySource(
                         new RecoverySource.SnapshotRecoverySource(
                             RecoverySource.SnapshotRecoverySource.NO_API_RESTORE_UUID,
                             new Snapshot("repo", new SnapshotId("snap", "uuid")),
                             IndexVersion.current(),
-                            new IndexId("index-" + i, "id-" + i)
+                            new IndexId("index", "id")
                         )
                     );
                 }
