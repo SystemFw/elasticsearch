@@ -61,16 +61,16 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
     }
 
     public void testRestoreStatesRequiringStats() {
-        record CollectionCase(String description, List<ShardRoutingState> restoreStates, boolean expectStats) {}
+        record CollectionCase(String description, List<ShardRoutingState> restoreStates, int expectedRequests) {}
 
         var cases = List.of(
-            new CollectionCase("no restore", List.of(), false),
-            new CollectionCase("waiting", List.of(UNASSIGNED), true),
-            new CollectionCase("recovering", List.of(INITIALIZING), true),
-            new CollectionCase("completed", List.of(STARTED), false),
-            new CollectionCase("multiple waiting", List.of(UNASSIGNED, UNASSIGNED), true),
-            new CollectionCase("one still recovering", List.of(STARTED, INITIALIZING), true),
-            new CollectionCase("all completed", List.of(STARTED, STARTED), false)
+            new CollectionCase("no restore", List.of(), 0),
+            new CollectionCase("waiting", List.of(UNASSIGNED), 1),
+            new CollectionCase("recovering", List.of(INITIALIZING), 1),
+            new CollectionCase("completed", List.of(STARTED), 0),
+            new CollectionCase("multiple waiting", List.of(UNASSIGNED, UNASSIGNED), 1),
+            new CollectionCase("one still recovering", List.of(STARTED, INITIALIZING), 1),
+            new CollectionCase("all completed", List.of(STARTED, STARTED), 0)
         );
         for (var testCase : cases) {
             var overrides = Settings.builder()
@@ -78,8 +78,8 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                 .build();
             var fixture = new Fixture(overrides);
             fixture.setRestores(testCase.restoreStates().toArray(ShardRoutingState[]::new));
-            assertEquals(testCase.description(), testCase.expectStats() ? 1 : 0, fixture.storeRequests);
-            assertEquals(testCase.description(), testCase.expectStats() ? 1 : 0, fixture.nodeStatsRequests);
+            assertEquals(testCase.description(), testCase.expectedRequests(), fixture.storeRequests);
+            assertEquals(testCase.description(), testCase.expectedRequests(), fixture.nodeStatsRequests);
             fixture.completeRefresh();
         }
     }
