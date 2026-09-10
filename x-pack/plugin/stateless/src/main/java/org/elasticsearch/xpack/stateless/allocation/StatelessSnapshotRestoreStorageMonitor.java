@@ -17,27 +17,28 @@ import org.elasticsearch.common.Priority;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Supplier;
 
-/** Retries waiting snapshot primaries when indexing-node storage information changes. */
+/** Requests reroutes for pending snapshot restores when indexing-node storage information changes. */
 public class StatelessSnapshotRestoreStorageMonitor {
     private static final Logger logger = LogManager.getLogger(StatelessSnapshotRestoreStorageMonitor.class);
     private final Supplier<ClusterState> clusterState;
     private final RerouteService rerouteService;
+    // Accessed only by onNewInfo callbacks. InternalClusterInfoService serializes these callbacks and
+    // safely publishes their writes through the synchronized refresh handoff, even when the callback thread changes.
     private Map<String, Storage> previous = Map.of();
 
     private record Storage(String path, long freeBytes, ClusterInfo.ReservedSpace reservations) {}
 
-    /** Uses published cluster information so retries observe the same metrics as allocation. */
     public StatelessSnapshotRestoreStorageMonitor(Supplier<ClusterState> clusterState, RerouteService rerouteService) {
         this.clusterState = clusterState;
         this.rerouteService = rerouteService;
     }
 
-    /** Ignores updates to metrics unrelated to restore storage admission. */
-    public synchronized void onNewInfo(ClusterInfo info) {
+    public void onNewInfo(ClusterInfo info) {
         var state = clusterState.get();
         if (state.nodes().isLocalNodeElectedMaster() == false) {
             previous = Map.of();
@@ -53,7 +54,7 @@ public class StatelessSnapshotRestoreStorageMonitor {
             }
         }
         boolean changed = current.equals(previous) == false;
-        previous = current;
+        previous = Collections.unmodifiableMap(current);
         if (changed
             && state.getRoutingNodes()
                 .unassigned()
