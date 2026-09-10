@@ -28,6 +28,7 @@ import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.routing.RecoverySource;
+import org.elasticsearch.cluster.routing.RoutingTable;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.elasticsearch.cluster.routing.allocation.WriteLoadConstraintSettings;
@@ -100,7 +101,6 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
     );
 
     private final boolean stateless;
-    // Written by the cluster-applier thread and read by asynchronous refreshes.
     private volatile boolean snapshotRestoreStatsRequired;
     private volatile boolean diskThresholdEnabled;
     private volatile boolean estimatedHeapThresholdEnabled;
@@ -202,7 +202,7 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
                 .routingTables()
                 .values()
                 .stream()
-                .flatMap(table -> table.allShards())
+                .flatMap(RoutingTable::allShards)
                 .anyMatch(
                     shard -> shard.primary()
                         && (shard.unassigned() || shard.initializing())
@@ -223,6 +223,7 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
                 nextRefreshListeners.add(refreshScheduler.getListener());
             }
             if (startRestoreCollection) {
+                // ensures a refresh happens when the stats need collecting, even if there's no other listener queued up
                 nextRefreshListeners.add(ActionListener.noop());
             }
             newRefresh = getNewRefresh();
