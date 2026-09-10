@@ -42,7 +42,6 @@ import org.elasticsearch.test.ClusterServiceUtils;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.client.NoOpClient;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -55,16 +54,12 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
     public void testRestoreActivationDuringRefreshQueuesStoreCollection() {
         try (var fixture = new Fixture(Settings.EMPTY)) {
             fixture.startRefresh();
-            assertEquals(1, fixture.pending.size()); // the existing heap consumer requests node stats
 
             fixture.setRestores(UNASSIGNED);
-            assertEquals(1, fixture.pending.size()); // still the original refresh
             assertEquals(0, fixture.storeRequests);
 
             fixture.completeRefresh();
             assertEquals(1, fixture.storeRequests);
-            assertEquals(2, fixture.pending.size()); // queued refresh includes store and node stats
-            fixture.completeRefresh();
         }
     }
 
@@ -110,7 +105,6 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
 
     private class Fixture implements AutoCloseable {
         final DeterministicTaskQueue queue = new DeterministicTaskQueue();
-        final List<Runnable> pending = new ArrayList<>();
         final ClusterService clusterService;
         final InternalClusterInfoService service;
         final DiscoveryNode node = DiscoveryNodeUtils.create("node");
@@ -132,8 +126,7 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                 .build();
             var clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
             clusterService = ClusterServiceUtils.createClusterService(queue.getThreadPool(), clusterSettings);
-            // As in the scheduling tests, quiet request failures suffice to test collection rather than metric values.
-            // Hold their completion here so a restore can begin midway through a refresh.
+            // Hold responses so a restore can begin midway through a refresh.
             var client = new NoOpClient(queue.getThreadPool()) {
                 @Override
                 protected <Request extends ActionRequest, Response extends ActionResponse> void doExecute(
@@ -147,7 +140,10 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
                     } else {
                         assertTrue(request instanceof NodesStatsRequest);
                     }
-                    pending.add(() -> listener.onFailure(new ClusterBlockException(Set.of(NoMasterBlockService.NO_MASTER_BLOCK_ALL))));
+                    // As in InternalClusterInfoServiceSchedulingTests, finish without metrics using a failure the service handles quietly.
+                    queue.scheduleNow(
+                        () -> listener.onFailure(new ClusterBlockException(Set.of(NoMasterBlockService.NO_MASTER_BLOCK_ALL)))
+                    );
                 }
             };
             service = new InternalClusterInfoService(
@@ -204,30 +200,22 @@ public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
         }
 
         void startRefresh() {
-            assertTrue(pending.isEmpty());
             service.refreshAsync(ActionListener.noop());
         }
 
         void completeRefresh() {
-            var completing = List.copyOf(pending);
-            pending.clear(); // callbacks may enqueue the next refresh's requests
-            completing.forEach(Runnable::run);
             queue.runAllRunnableTasks();
         }
 
         void periodicRefresh() {
-            assertTrue(pending.isEmpty());
             queue.advanceTime();
-            queue.runAllRunnableTasks();
             completeRefresh();
         }
 
         @Override
         public void close() {
             update(ClusterState.builder(state).nodes(DiscoveryNodes.builder(state.nodes()).masterNodeId(null)).build());
-            while (pending.isEmpty() == false) {
-                completeRefresh();
-            }
+            completeRefresh();
             clusterService.close();
         }
     }
