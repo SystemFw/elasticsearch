@@ -49,7 +49,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.hamcrest.Matchers.containsString;
 
 /** Exercises restore admission through desired-balance simulation and reconciliation. */
-public class StatelessSnapshotRestoreAllocationTests extends ESAllocationTestCase {
+public class StatelessSnapshotRestoreAllocationDeciderTests extends ESAllocationTestCase {
     private static final long GB = ByteSizeValue.ofGb(1).getBytes();
     private static final String NODE = "index-node";
     private static final String PATH = "/data";
