@@ -49,6 +49,15 @@ import static org.mockito.Mockito.when;
 
 /** Exercises the extra collection demand from snapshot restores, independently of allocation and recovery. */
 public class InternalClusterInfoServiceSnapshotRestoreTests extends ESTestCase {
+    // by default, serverless activates heap stats, but disables indices stores stats
+    // I want to test:
+    //  - store stats get activated even if there's another refresh in progress
+    //  - store stats get activated when no refresh is in progress
+    //  - heap stats are collected  during a restore even if they are explicitly disabled
+    //  - maybe change the builder to evolve cluster state instead of the very surgical, but less clear, pattern we have here with setRestore
+    //  - check Settings default + assert maybe, instead of building them explicitly
+    //  - better names for the test cases
+
     public void testRestoreActivationDuringRefreshQueuesStoreCollection() {
         var fixture = new Fixture(CollectionMode.HEAP);
         fixture.startRefresh();
