@@ -23,8 +23,8 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /** Requests reroutes for pending snapshot restores when indexing-node storage information changes. */
-public class StatelessSnapshotRestoreStorageMonitor {
-    private static final Logger logger = LogManager.getLogger(StatelessSnapshotRestoreStorageMonitor.class);
+public class SnapshotRestoreStorageMonitor {
+    private static final Logger logger = LogManager.getLogger(SnapshotRestoreStorageMonitor.class);
     private final Supplier<ClusterState> clusterState;
     private final RerouteService rerouteService;
     // Accessed only by onNewInfo callbacks. InternalClusterInfoService serializes these callbacks and
@@ -33,7 +33,7 @@ public class StatelessSnapshotRestoreStorageMonitor {
 
     private record Storage(String path, long freeBytes, ClusterInfo.ReservedSpace reservations) {}
 
-    public StatelessSnapshotRestoreStorageMonitor(Supplier<ClusterState> clusterState, RerouteService rerouteService) {
+    public SnapshotRestoreStorageMonitor(Supplier<ClusterState> clusterState, RerouteService rerouteService) {
         this.clusterState = clusterState;
         this.rerouteService = rerouteService;
     }

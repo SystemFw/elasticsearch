@@ -18,7 +18,7 @@ import org.elasticsearch.cluster.routing.allocation.decider.DiskThresholdDecider
 import org.elasticsearch.common.unit.ByteSizeValue;
 
 /** Prevents snapshot restores from being admitted without space for their local files and a node-wide reserve. */
-public class StatelessSnapshotRestoreAllocationDecider extends AllocationDecider {
+public class SnapshotRestoreAllocationDecider extends AllocationDecider {
     private static final String NAME = "stateless_snapshot_restore_storage";
     private static final long HEADROOM_BYTES = ByteSizeValue.ofGb(5).getBytes();
 

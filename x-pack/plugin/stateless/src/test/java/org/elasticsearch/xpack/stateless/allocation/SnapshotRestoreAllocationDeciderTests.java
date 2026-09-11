@@ -49,11 +49,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.hamcrest.Matchers.containsString;
 
 /** Exercises restore admission through desired-balance simulation and reconciliation. */
-public class StatelessSnapshotRestoreAllocationDeciderTests extends ESAllocationTestCase {
+public class SnapshotRestoreAllocationDeciderTests extends ESAllocationTestCase {
     private static final long GB = ByteSizeValue.ofGb(1).getBytes();
     private static final String NODE = "index-node";
     private static final String PATH = "/data";
-    private final StatelessSnapshotRestoreAllocationDecider decider = new StatelessSnapshotRestoreAllocationDecider();
+    private final SnapshotRestoreAllocationDecider decider = new SnapshotRestoreAllocationDecider();
 
     private ClusterState state(int count) {
         var metadata = Metadata.builder();
@@ -187,7 +187,7 @@ public class StatelessSnapshotRestoreAllocationDeciderTests extends ESAllocation
     public void testReservationChangesTriggerMonitorButInitializingRestoresDoNot() {
         var state = new AtomicReference<>(state(1));
         var reroutes = new AtomicInteger();
-        var monitor = new StatelessSnapshotRestoreStorageMonitor(state::get, (reason, priority, listener) -> {
+        var monitor = new SnapshotRestoreStorageMonitor(state::get, (reason, priority, listener) -> {
             reroutes.incrementAndGet();
             listener.onResponse(null);
         });
@@ -297,7 +297,7 @@ public class StatelessSnapshotRestoreAllocationDeciderTests extends ESAllocation
         var info = new AtomicReference<>(info(40 * GB));
         var service = service(info, sizes);
         AtomicInteger reroutes = new AtomicInteger();
-        var monitor = new StatelessSnapshotRestoreStorageMonitor(state::get, (reason, priority, listener) -> {
+        var monitor = new SnapshotRestoreStorageMonitor(state::get, (reason, priority, listener) -> {
             reroutes.incrementAndGet();
             state.set(service.reroute(state.get(), reason, listener));
         });
@@ -339,7 +339,7 @@ public class StatelessSnapshotRestoreAllocationDeciderTests extends ESAllocation
                 .build()
         );
         AtomicInteger reroutes = new AtomicInteger();
-        var monitor = new StatelessSnapshotRestoreStorageMonitor(state::get, (reason, priority, listener) -> {
+        var monitor = new SnapshotRestoreStorageMonitor(state::get, (reason, priority, listener) -> {
             reroutes.incrementAndGet();
             listener.onResponse(null);
         });
