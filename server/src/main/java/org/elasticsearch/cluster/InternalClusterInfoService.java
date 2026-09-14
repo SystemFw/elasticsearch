@@ -100,9 +100,8 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
         Property.Dynamic,
         Property.NodeScope
     );
-
+    // TODO to be replaced with proper setting for collection of node and disk stats
     private final boolean stateless;
-    private volatile boolean snapshotRestoreStatsRequired;
     private volatile boolean diskThresholdEnabled;
     private volatile boolean estimatedHeapThresholdEnabled;
     private volatile WriteLoadDeciderStatus writeLoadConstraintEnabled;
@@ -196,20 +195,6 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
 
     @Override
     public void clusterChanged(ClusterChangedEvent event) {
-        final Predicate<ClusterState> snaphotRestoreInProgress = state -> state.globalRoutingTable()
-            .routingTables()
-            .values()
-            .stream()
-            .flatMap(RoutingTable::allShards)
-            .anyMatch(
-                shard -> shard.primary()
-                    && (shard.unassigned() || shard.initializing())
-                    && shard.recoverySource().getType() == RecoverySource.Type.SNAPSHOT
-            );
-        snapshotRestoreStatsRequired = stateless
-            && event.localNodeMaster()
-            && snaphotRestoreInProgress.test(event.previousState()) == false
-            && snaphotRestoreInProgress.test(event.state());
         final Runnable newRefresh;
         synchronized (mutex) {
             if (event.localNodeMaster() == false) {
@@ -221,10 +206,6 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
                 logger.trace("elected as master, scheduling cluster info update tasks");
                 refreshScheduler = new RefreshScheduler();
                 nextRefreshListeners.add(refreshScheduler.getListener());
-            }
-            if (snapshotRestoreStatsRequired) {
-                // ensures a refresh happens when the stats need collecting, even if there's no other listener queued up
-                nextRefreshListeners.add(ActionListener.noop());
             }
             newRefresh = getNewRefresh();
             assert assertRefreshInvariant();
@@ -253,8 +234,8 @@ public class InternalClusterInfoService implements ClusterInfoService, ClusterSt
         private volatile Map<String, Long> hostedShardsPartitionSizeByNodeId = Map.of();
         private volatile IndicesStatsSummary indicesStatsSummary;
 
-        private final boolean collectStoreStats = diskThresholdEnabled || snapshotRestoreStatsRequired;
-        private final boolean collectNodeStats = diskThresholdEnabled || estimatedHeapThresholdEnabled || snapshotRestoreStatsRequired;
+        private final boolean collectStoreStats = diskThresholdEnabled || stateless;
+        private final boolean collectNodeStats = diskThresholdEnabled || estimatedHeapThresholdEnabled || stateless;
         private final List<ActionListener<ClusterInfo>> thisRefreshListeners;
         private final RefCountingRunnable fetchRefs = new RefCountingRunnable(this::callListeners);
 
