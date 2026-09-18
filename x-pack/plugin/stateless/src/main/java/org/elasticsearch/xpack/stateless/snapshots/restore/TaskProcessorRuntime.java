@@ -247,23 +247,16 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             listener.onFailure(new LeaseLostException("lease for task [" + handle.taskId() + "] is no longer active"));
             return;
         }
-        final ActionListener<S> updateListener = terminal
-            ? ActionListener.wrap(listener::onResponse, e -> listener.onFailure(terminalUpdateFailure(task, e)))
-            : listener;
         try {
-            queue.update(task.leaseState.lease(), newState, terminal, updateListener);
+            queue.update(task.leaseState.lease(), newState, terminal, listener);
         } catch (Exception e) {
-            updateListener.onFailure(e);
+            listener.onFailure(e);
         }
     }
 
     private synchronized ActiveTask currentTask(ActiveTask handle) {
         final ActiveTask task = active.get(handle.taskId());
         return task == handle ? task : null;
-    }
-
-    private synchronized Exception terminalUpdateFailure(ActiveTask task, Exception failure) {
-        return task.deferredLeaseLoss == null ? failure : task.deferredLeaseLoss;
     }
 
     private void scheduleNextLeaseCheck() {
@@ -396,11 +389,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             final LeaseState leaseState = task.leaseState;
             final long nowMillis = threadPool.absoluteTimeInMillis();
             if (failure instanceof LeaseLostException) {
-                loseLease = task.localState.get().terminalUpdate() == false;
+                loseLease = true;
                 task.leaseState = new LeaseState(leaseState.lease(), leaseState.lease().expiryMillis(), false);
-                if (loseLease == false) {
-                    task.deferredLeaseLoss = failure;
-                }
             } else if (nowMillis >= leaseState.lease().expiryMillis()) {
                 loseLease = true;
                 task.leaseState = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), false);
@@ -495,9 +485,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         // Replaced while holding TaskProcessorRuntime.this and read by queue operations after an authority check.
         private volatile LeaseState leaseState;
-
-        // Guarded by TaskProcessorRuntime.this.
-        private Exception deferredLeaseLoss;
 
         private final AtomicReference<LocalState<S>> localState;
 

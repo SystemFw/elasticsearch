@@ -149,7 +149,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
-    public void testFencedRenewalWaitsForInFlightFinish() {
+    public void testFencedRenewalFailsPendingFinishImmediately() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
@@ -167,12 +167,13 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
 
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
-        assertNull(cancelledTask.get());
-
-        queue.failFinish();
         assertThat(finishFailure.get(), instanceOf(LeaseLostException.class));
         assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
+
+        // The queue operation may still have committed even though its successful response arrived after lease loss.
+        queue.completeFinish();
+        assertThat(queue.states.get("task"), equalTo("finished"));
 
         runtime.stop();
         runtime.close();
@@ -269,7 +270,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private boolean failRenewalsWithLeaseLoss;
         private ActionListener<List<Tuple<String, Lease>>> pendingClaim;
         private PendingModification pendingModification;
-        private ActionListener<String> pendingFinish;
+        private PendingModification pendingFinish;
 
         private TestTaskQueue(DeterministicTaskQueue deterministicTaskQueue) {
             this.deterministicTaskQueue = deterministicTaskQueue;
@@ -333,7 +334,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             if (terminal) {
                 if (deferFinishes) {
                     assertNull(pendingFinish);
-                    pendingFinish = listener;
+                    pendingFinish = new PendingModification(lease.taskId(), newState, listener);
                 } else {
                     states.put(lease.taskId(), newState);
                     listener.onResponse(newState);
@@ -354,10 +355,11 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             modification.listener.onResponse(modification.state);
         }
 
-        void failFinish() {
-            var listener = pendingFinish;
+        void completeFinish() {
+            var finish = pendingFinish;
             pendingFinish = null;
-            listener.onFailure(new RuntimeException("simulated finish failure"));
+            states.put(finish.taskId, finish.state);
+            finish.listener.onResponse(finish.state);
         }
 
         @Override
