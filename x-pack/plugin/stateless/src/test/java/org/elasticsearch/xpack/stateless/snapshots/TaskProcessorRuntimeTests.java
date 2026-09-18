@@ -145,6 +145,36 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
+    public void testFencedRenewalWaitsForInFlightFinish() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        queue.deferFinishes = true;
+        queue.failRenewalsWithLeaseLoss = true;
+        var executionRef = new AtomicReference<TaskExecution<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
+
+        runtime.start();
+        deterministicTaskQueue.runAllRunnableTasks();
+        var execution = executionRef.get();
+        var finishFailure = new AtomicReference<Exception>();
+        var leaseLost = new AtomicBoolean();
+        execution.addLeaseLostListener(() -> leaseLost.set(true));
+        execution.finish("finished", ActionListener.wrap(ignored -> fail("finish unexpectedly succeeded"), finishFailure::set));
+
+        deterministicTaskQueue.advanceTime();
+        deterministicTaskQueue.runAllRunnableTasks();
+        assertFalse(leaseLost.get());
+
+        queue.failFinish();
+        assertThat(finishFailure.get(), instanceOf(LeaseLostException.class));
+        assertTrue(leaseLost.get());
+        assertThat(runtime.activeTaskCount(), equalTo(0));
+
+        runtime.stop();
+        runtime.close();
+    }
+
     public void testStopReleasesActiveLease() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
@@ -211,10 +241,12 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private long nextFencingToken;
         private boolean deferClaims;
         private boolean deferModifications;
+        private boolean deferFinishes;
         private boolean completeRenewals = true;
         private boolean failRenewalsWithLeaseLoss;
         private ActionListener<List<LeasedTask<String>>> pendingClaim;
         private PendingModification pendingModification;
+        private ActionListener<String> pendingFinish;
 
         private TestTaskQueue(DeterministicTaskQueue deterministicTaskQueue) {
             this.deterministicTaskQueue = deterministicTaskQueue;
@@ -293,8 +325,19 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
 
         @Override
         public void finish(Lease lease, String finalState, ActionListener<String> listener) {
-            states.put(lease.taskId(), finalState);
-            listener.onResponse(finalState);
+            if (deferFinishes) {
+                assertNull(pendingFinish);
+                pendingFinish = listener;
+            } else {
+                states.put(lease.taskId(), finalState);
+                listener.onResponse(finalState);
+            }
+        }
+
+        void failFinish() {
+            var listener = pendingFinish;
+            pendingFinish = null;
+            listener.onFailure(new RuntimeException("simulated finish failure"));
         }
 
         @Override
