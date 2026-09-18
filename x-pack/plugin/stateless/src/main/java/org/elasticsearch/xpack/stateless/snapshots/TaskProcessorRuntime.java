@@ -14,6 +14,7 @@ import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.threadpool.Scheduler;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.xpack.stateless.snapshots.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeasedTask;
@@ -28,7 +29,7 @@ import java.util.concurrent.Executor;
 /**
  * Runs a processor against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management.
  */
-public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent implements TaskImpl.Operations<S> {
+public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
     private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
 
@@ -40,7 +41,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
     private final int maxConcurrentTasks;
     private final TimeValue leaseDuration;
     private final TimeValue claimInterval;
-    private final Map<String, ActiveTask<S>> active = new HashMap<>();
+    private final Map<String, ActiveTask> active = new HashMap<>();
 
     // The following fields are guarded by this.
     private boolean running;
@@ -92,15 +93,15 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
 
     @Override
     protected void doStop() {
-        final List<ActiveTask<S>> tasks;
+        final List<ActiveTask> tasks;
         synchronized (this) {
             running = false;
             cancelNextClaim();
             cancelNextLeaseCheck();
             tasks = List.copyOf(active.values());
         }
-        for (ActiveTask<S> task : tasks) {
-            if (task.execution.runtimeStopped()) {
+        for (ActiveTask task : tasks) {
+            if (task.handle.runtimeStopped()) {
                 release(task);
             }
         }
@@ -134,7 +135,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
 
     private void claimsCompleted(List<LeasedTask<S>> claimedTasks) {
         Objects.requireNonNull(claimedTasks);
-        final List<TaskImpl<S>> toStart = new ArrayList<>();
+        final List<TaskHandleImpl> toStart = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
         final boolean shouldPollLater;
 
@@ -149,10 +150,10 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
                     if (remainingCapacity > 0
                         && active.containsKey(task.lease().taskId()) == false
                         && task.lease().expiryMillis() > nowMillis) {
-                        var execution = new TaskImpl<>(task.lease().taskId(), task.state(), this, this::cancelTask, this::executionEnded);
-                        var activeTask = new ActiveTask<>(execution, task.lease(), renewalTime(nowMillis, task.lease().expiryMillis()));
+                        var handle = new TaskHandleImpl(task.lease().taskId(), task.state());
+                        var activeTask = new ActiveTask(handle, task.lease(), renewalTime(nowMillis, task.lease().expiryMillis()));
                         active.put(task.lease().taskId(), activeTask);
-                        toStart.add(execution);
+                        toStart.add(handle);
                         remainingCapacity--;
                     } else {
                         toRelease.add(task.lease());
@@ -209,27 +210,27 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    private void startExecution(TaskImpl<S> execution) {
-        if (execution.canProcess() == false) {
+    private void startExecution(TaskHandleImpl handle) {
+        if (handle.canProcess() == false) {
             return;
         }
         try {
             processorExecutor.execute(() -> {
-                if (execution.canProcess() == false) {
+                if (handle.canProcess() == false) {
                     return;
                 }
                 try {
-                    processor.process(execution);
+                    processor.process(handle);
                 } catch (Exception e) {
-                    execution.processorFailed(e);
+                    handle.processorFailed(e);
                 }
             });
         } catch (Exception e) {
-            execution.processorFailed(e);
+            handle.processorFailed(e);
         }
     }
 
-    private void cancelTask(TaskImpl<S> task) {
+    private void cancelTask(TaskHandleImpl task) {
         try {
             processor.cancel(task);
         } catch (Exception e) {
@@ -237,11 +238,10 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    @Override
-    public void modify(TaskImpl<S> execution, S newState, ActionListener<S> listener) {
-        final ActiveTask<S> task = currentTask(execution);
+    private void modify(TaskHandleImpl handle, S newState, ActionListener<S> listener) {
+        final ActiveTask task = currentTask(handle);
         if (task == null) {
-            listener.onFailure(new LeaseLostException("lease for task [" + execution.taskId() + "] is no longer active"));
+            listener.onFailure(new LeaseLostException("lease for task [" + handle.taskId() + "] is no longer active"));
             return;
         }
         try {
@@ -251,11 +251,10 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    @Override
-    public void finish(TaskImpl<S> execution, S finalState, ActionListener<S> listener) {
-        final ActiveTask<S> task = currentTask(execution);
+    private void finish(TaskHandleImpl handle, S finalState, ActionListener<S> listener) {
+        final ActiveTask task = currentTask(handle);
         if (task == null) {
-            listener.onFailure(new LeaseLostException("lease for task [" + execution.taskId() + "] is no longer active"));
+            listener.onFailure(new LeaseLostException("lease for task [" + handle.taskId() + "] is no longer active"));
             return;
         }
         final ActionListener<S> finishListener = ActionListener.wrap(listener::onResponse, e -> listener.onFailure(finishFailure(task, e)));
@@ -266,17 +265,17 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    private synchronized ActiveTask<S> currentTask(TaskImpl<S> execution) {
-        final ActiveTask<S> task = active.get(execution.taskId());
-        return task != null && task.execution == execution ? task : null;
+    private synchronized ActiveTask currentTask(TaskHandleImpl handle) {
+        final ActiveTask task = active.get(handle.taskId());
+        return task != null && task.handle == handle ? task : null;
     }
 
-    private synchronized Exception finishFailure(ActiveTask<S> task, Exception failure) {
+    private synchronized Exception finishFailure(ActiveTask task, Exception failure) {
         return task.deferredLeaseLoss == null ? failure : task.deferredLeaseLoss;
     }
 
     private void scheduleNextLeaseCheck() {
-        List<ActiveTask<S>> failedTasks = null;
+        List<ActiveTask> failedTasks = null;
         Exception schedulingFailure = null;
         synchronized (this) {
             if (running == false || active.isEmpty()) {
@@ -285,7 +284,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
             }
 
             long checkAtMillis = Long.MAX_VALUE;
-            for (ActiveTask<S> task : active.values()) {
+            for (ActiveTask task : active.values()) {
                 final long taskCheckAt = task.renewalInProgress
                     ? task.lease.expiryMillis()
                     : Math.min(task.renewAtMillis, task.lease.expiryMillis());
@@ -315,13 +314,13 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
 
         if (failedTasks != null) {
             final var failure = new LeaseLostException("could not schedule lease management", schedulingFailure);
-            failedTasks.forEach(task -> task.execution.leaseLost(failure));
+            failedTasks.forEach(task -> task.handle.leaseLost(failure));
         }
     }
 
     private void checkLeases(long generation) {
-        final List<ActiveTask<S>> expired = new ArrayList<>();
-        final List<ActiveTask<S>> toRenew = new ArrayList<>();
+        final List<ActiveTask> expired = new ArrayList<>();
+        final List<ActiveTask> toRenew = new ArrayList<>();
         synchronized (this) {
             if (generation != leaseCheckGeneration) {
                 return;
@@ -333,7 +332,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
             }
 
             final long nowMillis = threadPool.absoluteTimeInMillis();
-            for (ActiveTask<S> task : active.values()) {
+            for (ActiveTask task : active.values()) {
                 if (nowMillis >= task.lease.expiryMillis()) {
                     expired.add(task);
                 } else if (task.renewalInProgress == false && nowMillis >= task.renewAtMillis) {
@@ -343,17 +342,15 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
             }
         }
 
-        expired.forEach(
-            task -> task.execution.leaseLost(new LeaseLostException("lease for task [" + task.lease.taskId() + "] has expired"))
-        );
+        expired.forEach(task -> task.handle.leaseLost(new LeaseLostException("lease for task [" + task.lease.taskId() + "] has expired")));
         toRenew.forEach(this::renew);
         scheduleNextLeaseCheck();
     }
 
-    private void renew(ActiveTask<S> task) {
+    private void renew(ActiveTask task) {
         final Lease lease;
         synchronized (this) {
-            if (running == false || active.get(task.execution.taskId()) != task) {
+            if (running == false || active.get(task.handle.taskId()) != task) {
                 return;
             }
             lease = task.lease;
@@ -368,10 +365,10 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    private void leaseRenewed(ActiveTask<S> task, Lease previousLease, Lease renewedLease) {
+    private void leaseRenewed(ActiveTask task, Lease previousLease, Lease renewedLease) {
         Exception invalidLease = null;
         synchronized (this) {
-            if (running == false || active.get(task.execution.taskId()) != task) {
+            if (running == false || active.get(task.handle.taskId()) != task) {
                 return;
             }
             task.renewalInProgress = false;
@@ -380,7 +377,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
                 || renewedLease == null
                 || sameLeaseIncarnation(previousLease, renewedLease) == false
                 || renewedLease.expiryMillis() <= nowMillis) {
-                invalidLease = new LeaseLostException("queue returned an invalid renewed lease for task [" + task.execution.taskId() + "]");
+                invalidLease = new LeaseLostException("queue returned an invalid renewed lease for task [" + task.handle.taskId() + "]");
             } else {
                 task.lease = renewedLease;
                 task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
@@ -390,27 +387,27 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         if (invalidLease == null) {
             scheduleNextLeaseCheck();
         } else {
-            task.execution.leaseLost(invalidLease);
+            task.handle.leaseLost(invalidLease);
         }
     }
 
-    private void leaseRenewalFailed(ActiveTask<S> task, Exception failure) {
+    private void leaseRenewalFailed(ActiveTask task, Exception failure) {
         final boolean loseLease;
         synchronized (this) {
-            if (running == false || active.get(task.execution.taskId()) != task) {
+            if (running == false || active.get(task.handle.taskId()) != task) {
                 return;
             }
             task.renewalInProgress = false;
             final long nowMillis = threadPool.absoluteTimeInMillis();
             if (failure instanceof LeaseLostException) {
-                loseLease = task.execution.isFinishing() == false;
+                loseLease = task.handle.isFinishing() == false;
                 task.renewAtMillis = task.lease.expiryMillis();
                 if (loseLease == false) {
                     task.deferredLeaseLoss = failure;
                 }
             } else if (nowMillis >= task.lease.expiryMillis()) {
                 loseLease = true;
-                failure = new LeaseLostException("lease for task [" + task.execution.taskId() + "] has expired", failure);
+                failure = new LeaseLostException("lease for task [" + task.handle.taskId() + "] has expired", failure);
             } else {
                 loseLease = false;
                 final long normalRetryMillis = Math.max(1L, leaseDuration.millis() / 10L);
@@ -420,7 +417,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
 
         if (loseLease) {
-            task.execution.leaseLost(failure);
+            task.handle.leaseLost(failure);
         } else {
             scheduleNextLeaseCheck();
         }
@@ -445,9 +442,9 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         nextLeaseCheckAtMillis = Long.MAX_VALUE;
     }
 
-    private void release(ActiveTask<S> task) {
+    private void release(ActiveTask task) {
         final ActionListener<Void> listener = ActionListener.assertOnce(
-            ActionListener.wrap(ignored -> task.execution.releaseCompleted(null), task.execution::releaseCompleted)
+            ActionListener.wrap(ignored -> task.handle.releaseCompleted(null), task.handle::releaseCompleted)
         );
         try {
             queue.release(task.lease, listener);
@@ -456,12 +453,12 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    private void executionEnded(TaskImpl<S> execution) {
+    private void taskEnded(TaskHandleImpl handle) {
         final boolean refill;
         synchronized (this) {
-            final ActiveTask<S> task = active.get(execution.taskId());
-            if (task != null && task.execution == execution) {
-                active.remove(execution.taskId());
+            final ActiveTask task = active.get(handle.taskId());
+            if (task != null && task.handle == handle) {
+                active.remove(handle.taskId());
             }
             refill = running;
         }
@@ -488,15 +485,219 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         return active.size();
     }
 
-    private static final class ActiveTask<S> {
-        private final TaskImpl<S> execution;
+    /** Implements the processor-facing state machine for one lease incarnation. */
+    private final class TaskHandleImpl implements TaskHandle<S> {
+
+        private enum Status {
+            ACTIVE,
+            MODIFYING,
+            FINISHING,
+            RELEASING,
+            LEASE_LOST,
+            FINISHED,
+            RELEASED
+        }
+
+        private final String taskId;
+
+        // The following fields are guarded by this.
+        private S state;
+        private Status status = Status.ACTIVE;
+        private ActionListener<S> pendingStateListener;
+
+        private TaskHandleImpl(String taskId, S state) {
+            this.taskId = Objects.requireNonNull(taskId);
+            this.state = Objects.requireNonNull(state);
+        }
+
+        private String taskId() {
+            return taskId;
+        }
+
+        private synchronized boolean canProcess() {
+            return isLive(status);
+        }
+
+        private synchronized boolean isFinishing() {
+            return status == Status.FINISHING;
+        }
+
+        @Override
+        public synchronized S state() {
+            return state;
+        }
+
+        @Override
+        public void modify(S newState, ActionListener<S> listener) {
+            changeState(newState, Status.MODIFYING, listener);
+        }
+
+        @Override
+        public void finish(S finalState, ActionListener<S> listener) {
+            changeState(finalState, Status.FINISHING, listener);
+        }
+
+        private void changeState(S newState, Status operation, ActionListener<S> listener) {
+            Objects.requireNonNull(newState);
+            Objects.requireNonNull(listener);
+
+            final Exception rejection;
+            synchronized (this) {
+                if (status == Status.ACTIVE) {
+                    status = operation;
+                    pendingStateListener = listener;
+                    rejection = null;
+                } else {
+                    rejection = operationRejection();
+                }
+            }
+
+            if (rejection != null) {
+                listener.onFailure(rejection);
+                return;
+            }
+
+            final ActionListener<S> operationListener = ActionListener.assertOnce(
+                ActionListener.wrap(persistedState -> stateChangeCompleted(operation, persistedState), this::stateChangeFailed)
+            );
+            if (operation == Status.MODIFYING) {
+                TaskProcessorRuntime.this.modify(this, newState, operationListener);
+            } else {
+                TaskProcessorRuntime.this.finish(this, newState, operationListener);
+            }
+        }
+
+        private Exception operationRejection() {
+            return switch (status) {
+                case RELEASING, LEASE_LOST, RELEASED -> new LeaseLostException("lease for task [" + taskId + "] is no longer active");
+                case FINISHED -> new IllegalStateException("task [" + taskId + "] is already finished");
+                case MODIFYING, FINISHING -> new IllegalStateException(
+                    "task [" + taskId + "] already has a persistent state change in progress"
+                );
+                case ACTIVE -> throw new AssertionError("active task must accept the operation");
+            };
+        }
+
+        private void stateChangeCompleted(Status operation, S persistedState) {
+            final ActionListener<S> listener;
+            final boolean finished;
+            synchronized (this) {
+                if (status != operation) {
+                    return;
+                }
+
+                state = Objects.requireNonNull(persistedState);
+                listener = pendingStateListener;
+                pendingStateListener = null;
+                finished = operation == Status.FINISHING;
+                status = finished ? Status.FINISHED : Status.ACTIVE;
+            }
+
+            if (finished) {
+                taskEnded(this);
+            }
+            listener.onResponse(persistedState);
+        }
+
+        private void stateChangeFailed(Exception failure) {
+            if (failure instanceof LeaseLostException) {
+                leaseLost(failure);
+                return;
+            }
+
+            final ActionListener<S> listener;
+            synchronized (this) {
+                if (status != Status.MODIFYING && status != Status.FINISHING) {
+                    return;
+                }
+                status = Status.ACTIVE;
+                listener = pendingStateListener;
+                pendingStateListener = null;
+            }
+            listener.onFailure(failure);
+        }
+
+        private void processorFailed(Exception failure) {
+            logger.warn(() -> "task processor failed unexpectedly for task [" + taskId + "]", failure);
+            leaseLost(new LeaseLostException("task processor failed for task [" + taskId + "]", failure));
+        }
+
+        private boolean runtimeStopped() {
+            final ActionListener<S> stateListener;
+            synchronized (this) {
+                if (isTerminal(status)) {
+                    return false;
+                }
+                status = Status.RELEASING;
+                stateListener = pendingStateListener;
+                pendingStateListener = null;
+            }
+
+            final var failure = new LeaseLostException("runtime stopped while processing task [" + taskId + "]");
+            cancelTask(this);
+            if (stateListener != null) {
+                notifyStateFailure(stateListener, failure);
+            }
+            return true;
+        }
+
+        private void releaseCompleted(Exception failure) {
+            synchronized (this) {
+                if (status != Status.RELEASING) {
+                    return;
+                }
+                status = Status.RELEASED;
+            }
+            if (failure != null) {
+                logger.debug(() -> "failed to release lease for task [" + taskId + "]", failure);
+            }
+            taskEnded(this);
+        }
+
+        private void leaseLost(Exception failure) {
+            final ActionListener<S> stateListener;
+            synchronized (this) {
+                if (isTerminal(status)) {
+                    return;
+                }
+                status = Status.LEASE_LOST;
+                stateListener = pendingStateListener;
+                pendingStateListener = null;
+            }
+
+            cancelTask(this);
+            taskEnded(this);
+            if (stateListener != null) {
+                notifyStateFailure(stateListener, failure);
+            }
+        }
+
+        private void notifyStateFailure(ActionListener<S> listener, Exception failure) {
+            try {
+                listener.onFailure(failure);
+            } catch (Exception e) {
+                logger.warn(() -> "state-change listener failed while handling lease loss for task [" + taskId + "]", e);
+            }
+        }
+
+        private static boolean isLive(Status status) {
+            return status == Status.ACTIVE || status == Status.MODIFYING || status == Status.FINISHING;
+        }
+
+        private static boolean isTerminal(Status status) {
+            return status == Status.RELEASING || status == Status.LEASE_LOST || status == Status.FINISHED || status == Status.RELEASED;
+        }
+    }
+
+    private final class ActiveTask {
+        private final TaskHandleImpl handle;
         private volatile Lease lease;
         private long renewAtMillis;
         private boolean renewalInProgress;
         private Exception deferredLeaseLoss;
 
-        private ActiveTask(TaskImpl<S> execution, Lease lease, long renewAtMillis) {
-            this.execution = execution;
+        private ActiveTask(TaskHandleImpl handle, Lease lease, long renewAtMillis) {
+            this.handle = handle;
             this.lease = lease;
             this.renewAtMillis = renewAtMillis;
         }
