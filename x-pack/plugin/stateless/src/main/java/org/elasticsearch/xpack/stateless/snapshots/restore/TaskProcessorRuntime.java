@@ -13,17 +13,15 @@ import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
-import org.elasticsearch.threadpool.Scheduler;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -42,19 +40,64 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private final int maxConcurrentTasks;
     private final TimeValue leaseDuration;
     private final TimeValue claimInterval;
-    private final Map<String, ActiveTask> active = new HashMap<>();
+    private final ConcurrentHashMap<String, ActiveTask> active = new ConcurrentHashMap<>();
 
-    // The following fields are guarded by this.
-    private boolean running;
-    private boolean claimInProgress;
-    private Scheduler.Cancellable nextClaim;
-    private Scheduler.Cancellable nextLeaseCheck;
-    private long nextLeaseCheckAtMillis = Long.MAX_VALUE;
-    private long leaseCheckGeneration;
+    // Scheduled callbacks validate their generation against this state instead of being cancelled.
+    private final AtomicReference<RuntimeState> runtimeState = new AtomicReference<>(RuntimeState.initial());
 
     private record LocalState<T>(T state, boolean closed, boolean terminalUpdate, ActionListener<T> updateListener) {}
 
     private record LeaseState(Lease lease, long renewAtMillis, boolean renewalInProgress) {}
+
+    private record RuntimeState(
+        boolean running,
+        boolean claimInProgress,
+        boolean claimScheduled,
+        long claimGeneration,
+        long leaseCheckAtMillis,
+        long leaseCheckGeneration
+    ) {
+
+        private static RuntimeState initial() {
+            return new RuntimeState(false, false, false, 0L, Long.MAX_VALUE, 0L);
+        }
+
+        private RuntimeState started() {
+            return new RuntimeState(true, claimInProgress, claimScheduled, claimGeneration, leaseCheckAtMillis, leaseCheckGeneration);
+        }
+
+        private RuntimeState stopped() {
+            return new RuntimeState(false, claimInProgress, false, claimGeneration + 1L, Long.MAX_VALUE, leaseCheckGeneration + 1L);
+        }
+
+        private RuntimeState claimStarted() {
+            return new RuntimeState(true, true, false, claimGeneration + 1L, leaseCheckAtMillis, leaseCheckGeneration);
+        }
+
+        private RuntimeState scheduleClaim() {
+            return new RuntimeState(true, false, true, claimGeneration + 1L, leaseCheckAtMillis, leaseCheckGeneration);
+        }
+
+        private RuntimeState scheduledClaimStarted() {
+            return new RuntimeState(true, true, false, claimGeneration, leaseCheckAtMillis, leaseCheckGeneration);
+        }
+
+        private RuntimeState claimCompleted() {
+            return new RuntimeState(running, false, claimScheduled, claimGeneration, leaseCheckAtMillis, leaseCheckGeneration);
+        }
+
+        private RuntimeState claimScheduleCleared() {
+            return new RuntimeState(running, claimInProgress, false, claimGeneration, leaseCheckAtMillis, leaseCheckGeneration);
+        }
+
+        private RuntimeState leaseCheckScheduled(long checkAtMillis) {
+            return new RuntimeState(running, claimInProgress, claimScheduled, claimGeneration, checkAtMillis, leaseCheckGeneration + 1L);
+        }
+
+        private RuntimeState leaseCheckCleared() {
+            return new RuntimeState(running, claimInProgress, claimScheduled, claimGeneration, Long.MAX_VALUE, leaseCheckGeneration);
+        }
+    }
 
     /** Creates a runtime for one task type and processor. */
     public TaskProcessorRuntime(
@@ -90,22 +133,14 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
     @Override
     protected void doStart() {
-        synchronized (this) {
-            running = true;
-        }
+        runtimeState.getAndUpdate(RuntimeState::started);
         fillCapacity();
     }
 
     @Override
     protected void doStop() {
-        final List<ActiveTask> tasks;
-        synchronized (this) {
-            running = false;
-            cancelNextClaim();
-            cancelNextLeaseCheck();
-            tasks = List.copyOf(active.values());
-        }
-        for (ActiveTask task : tasks) {
+        runtimeState.getAndUpdate(RuntimeState::stopped);
+        for (ActiveTask task : active.values()) {
             if (task.runtimeStopped()) {
                 release(task);
             }
@@ -116,18 +151,25 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     protected void doClose() {}
 
     private void fillCapacity() {
-        final int capacity;
-        synchronized (this) {
-            if (running == false || claimInProgress) {
-                return;
-            }
-            capacity = maxConcurrentTasks - active.size();
-            if (capacity <= 0) {
-                return;
-            }
-            claimInProgress = true;
+        final int capacity = maxConcurrentTasks - active.size();
+        if (capacity <= 0) {
+            return;
         }
 
+        final RuntimeState previous = runtimeState.getAndUpdate(state -> {
+            if (state.running() == false || state.claimInProgress()) {
+                return state;
+            }
+            return state.claimStarted();
+        });
+        if (previous.running() == false || previous.claimInProgress()) {
+            return;
+        }
+
+        claim(capacity);
+    }
+
+    private void claim(int capacity) {
         final ActionListener<List<Tuple<S, Lease>>> listener = ActionListener.assertOnce(
             ActionListener.wrap(this::claimsCompleted, this::claimFailed)
         );
@@ -142,72 +184,87 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         Objects.requireNonNull(claimedTasks);
         final List<ActiveTask> toStart = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
-        final boolean shouldPollLater;
 
-        synchronized (this) {
-            claimInProgress = false;
-            if (running == false) {
-                claimedTasks.forEach(task -> toRelease.add(task.v2()));
-            } else {
-                int remainingCapacity = maxConcurrentTasks - active.size();
-                final long nowMillis = threadPool.absoluteTimeInMillis();
-                for (Tuple<S, Lease> task : claimedTasks) {
-                    final Lease lease = task.v2();
-                    if (remainingCapacity > 0 && active.containsKey(lease.taskId()) == false && lease.expiryMillis() > nowMillis) {
-                        var activeTask = new ActiveTask(task.v1(), lease, renewalTime(nowMillis, lease.expiryMillis()));
-                        active.put(lease.taskId(), activeTask);
+        final long nowMillis = threadPool.absoluteTimeInMillis();
+        for (Tuple<S, Lease> task : claimedTasks) {
+            final Lease lease = task.v2();
+            if (runtimeState.get().running() && active.size() < maxConcurrentTasks && lease.expiryMillis() > nowMillis) {
+                final var activeTask = new ActiveTask(task.v1(), lease, renewalTime(nowMillis, lease.expiryMillis()));
+                if (active.putIfAbsent(lease.taskId(), activeTask) == null) {
+                    if (runtimeState.get().running()) {
                         toStart.add(activeTask);
-                        remainingCapacity--;
-                    } else {
-                        toRelease.add(lease);
+                    } else if (activeTask.runtimeStopped()) {
+                        release(activeTask);
                     }
+                    continue;
                 }
             }
-            shouldPollLater = running && active.size() < maxConcurrentTasks;
+            toRelease.add(lease);
         }
+        runtimeState.getAndUpdate(RuntimeState::claimCompleted);
 
         toRelease.forEach(this::releaseUnstartedLease);
         scheduleNextLeaseCheck();
         toStart.forEach(this::startExecution);
-
-        if (shouldPollLater) {
-            scheduleNextClaim();
-        }
+        scheduleNextClaim();
     }
 
     private void claimFailed(Exception failure) {
-        synchronized (this) {
-            claimInProgress = false;
-            if (running == false) {
-                return;
-            }
+        final RuntimeState previous = runtimeState.getAndUpdate(RuntimeState::claimCompleted);
+        if (previous.running() == false) {
+            return;
         }
         logger.debug("failed to claim queued tasks", failure);
         scheduleNextClaim();
     }
 
     private void scheduleNextClaim() {
-        synchronized (this) {
-            if (running == false || nextClaim != null || claimInProgress || active.size() >= maxConcurrentTasks) {
-                return;
+        if (active.size() >= maxConcurrentTasks) {
+            return;
+        }
+
+        final RuntimeState previous = runtimeState.getAndUpdate(state -> {
+            if (state.running() == false || state.claimInProgress() || state.claimScheduled()) {
+                return state;
             }
-            try {
-                nextClaim = threadPool.schedule(() -> {
-                    synchronized (TaskProcessorRuntime.this) {
-                        nextClaim = null;
-                    }
-                    fillCapacity();
-                }, claimInterval, threadPool.generic());
-            } catch (Exception e) {
-                logger.debug("failed to schedule the next task claim", e);
-            }
+            return state.scheduleClaim();
+        });
+        if (previous.running() == false || previous.claimInProgress() || previous.claimScheduled()) {
+            return;
+        }
+
+        final long generation = previous.claimGeneration() + 1L;
+        try {
+            threadPool.schedule(() -> runScheduledClaim(generation), claimInterval, threadPool.generic());
+        } catch (Exception e) {
+            runtimeState.getAndUpdate(state -> {
+                if (state.claimScheduled() && state.claimGeneration() == generation) {
+                    return state.claimScheduleCleared();
+                }
+                return state;
+            });
+            logger.debug("failed to schedule the next task claim", e);
         }
     }
 
-    private void cancelNextClaim() {
-        if (nextClaim != null) {
-            nextClaim.cancel();
-            nextClaim = null;
+    private void runScheduledClaim(long generation) {
+        final int capacity = maxConcurrentTasks - active.size();
+        final RuntimeState previous = runtimeState.getAndUpdate(state -> {
+            if (state.claimScheduled() == false || state.claimGeneration() != generation) {
+                return state;
+            }
+            if (state.running() && state.claimInProgress() == false && capacity > 0) {
+                return state.scheduledClaimStarted();
+            }
+            return state.claimScheduleCleared();
+        });
+
+        if (previous.running()
+            && previous.claimInProgress() == false
+            && previous.claimScheduled()
+            && previous.claimGeneration() == generation
+            && capacity > 0) {
+            claim(capacity);
         }
     }
 
@@ -246,104 +303,102 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             return;
         }
         try {
-            queue.update(task.leaseState.lease(), newState, terminal, listener);
+            queue.update(task.leaseState.get().lease(), newState, terminal, listener);
         } catch (Exception e) {
             listener.onFailure(e);
         }
     }
 
-    private synchronized ActiveTask currentTask(ActiveTask handle) {
+    private ActiveTask currentTask(ActiveTask handle) {
         final ActiveTask task = active.get(handle.taskId());
         return task == handle ? task : null;
     }
 
     private void scheduleNextLeaseCheck() {
-        List<ActiveTask> failedTasks = null;
-        Exception schedulingFailure = null;
-        synchronized (this) {
-            if (running == false || active.isEmpty()) {
-                cancelNextLeaseCheck();
-                return;
-            }
-
-            long checkAtMillis = Long.MAX_VALUE;
-            for (ActiveTask task : active.values()) {
-                final LeaseState leaseState = task.leaseState;
-                final long taskCheckAt = leaseState.renewalInProgress()
-                    ? leaseState.lease().expiryMillis()
-                    : Math.min(leaseState.renewAtMillis(), leaseState.lease().expiryMillis());
-                checkAtMillis = Math.min(checkAtMillis, taskCheckAt);
-            }
-            if (nextLeaseCheck != null && nextLeaseCheckAtMillis <= checkAtMillis) {
-                return;
-            }
-
-            cancelNextLeaseCheck();
-            final long generation = ++leaseCheckGeneration;
-            final long delayMillis = Math.max(1L, checkAtMillis - threadPool.absoluteTimeInMillis());
-            try {
-                nextLeaseCheckAtMillis = checkAtMillis;
-                nextLeaseCheck = threadPool.schedule(
-                    () -> checkLeases(generation),
-                    TimeValue.timeValueMillis(delayMillis),
-                    threadPool.generic()
-                );
-            } catch (Exception e) {
-                nextLeaseCheck = null;
-                nextLeaseCheckAtMillis = Long.MAX_VALUE;
-                failedTasks = List.copyOf(active.values());
-                schedulingFailure = e;
-            }
+        if (runtimeState.get().running() == false || active.isEmpty()) {
+            return;
         }
 
-        if (failedTasks != null) {
-            final var failure = new LeaseLostException("could not schedule lease management", schedulingFailure);
-            failedTasks.forEach(task -> task.leaseLost(failure));
+        long checkAtMillis = Long.MAX_VALUE;
+        for (ActiveTask task : active.values()) {
+            final LeaseState leaseState = task.leaseState.get();
+            final long taskCheckAt = leaseState.renewalInProgress()
+                ? leaseState.lease().expiryMillis()
+                : Math.min(leaseState.renewAtMillis(), leaseState.lease().expiryMillis());
+            checkAtMillis = Math.min(checkAtMillis, taskCheckAt);
+        }
+        if (checkAtMillis == Long.MAX_VALUE) {
+            return;
+        }
+
+        final long nextCheckAtMillis = checkAtMillis;
+        final RuntimeState previous = runtimeState.getAndUpdate(state -> {
+            if (state.running() == false || state.leaseCheckAtMillis() <= nextCheckAtMillis) {
+                return state;
+            }
+            return state.leaseCheckScheduled(nextCheckAtMillis);
+        });
+        if (previous.running() == false || previous.leaseCheckAtMillis() <= nextCheckAtMillis) {
+            return;
+        }
+
+        final long generation = previous.leaseCheckGeneration() + 1L;
+        final long delayMillis = Math.max(1L, nextCheckAtMillis - threadPool.absoluteTimeInMillis());
+        try {
+            threadPool.schedule(() -> checkLeases(generation), TimeValue.timeValueMillis(delayMillis), threadPool.generic());
+        } catch (Exception e) {
+            final RuntimeState failedSchedule = runtimeState.getAndUpdate(state -> {
+                if (state.leaseCheckGeneration() == generation) {
+                    return state.leaseCheckCleared();
+                }
+                return state;
+            });
+            if (failedSchedule.running() && failedSchedule.leaseCheckGeneration() == generation) {
+                final var failure = new LeaseLostException("could not schedule lease management", e);
+                active.values().forEach(task -> task.leaseLost(failure));
+            }
         }
     }
 
     private void checkLeases(long generation) {
-        final List<ActiveTask> expired = new ArrayList<>();
-        final List<ActiveTask> toRenew = new ArrayList<>();
-        synchronized (this) {
-            if (generation != leaseCheckGeneration) {
-                return;
+        final RuntimeState previous = runtimeState.getAndUpdate(state -> {
+            if (state.running() == false || state.leaseCheckGeneration() != generation) {
+                return state;
             }
-            nextLeaseCheck = null;
-            nextLeaseCheckAtMillis = Long.MAX_VALUE;
-            if (running == false) {
-                return;
-            }
+            return state.leaseCheckCleared();
+        });
+        if (previous.running() == false || previous.leaseCheckGeneration() != generation) {
+            return;
+        }
 
-            final long nowMillis = threadPool.absoluteTimeInMillis();
-            for (ActiveTask task : active.values()) {
-                final LeaseState leaseState = task.leaseState;
-                if (nowMillis >= leaseState.lease().expiryMillis()) {
-                    expired.add(task);
-                } else if (leaseState.renewalInProgress() == false && nowMillis >= leaseState.renewAtMillis()) {
-                    task.leaseState = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), true);
-                    toRenew.add(task);
+        final List<ActiveTask> expired = new ArrayList<>();
+        final List<Tuple<ActiveTask, Lease>> toRenew = new ArrayList<>();
+        final long nowMillis = threadPool.absoluteTimeInMillis();
+        for (ActiveTask task : active.values()) {
+            final LeaseState leaseState = task.leaseState.get();
+            if (nowMillis >= leaseState.lease().expiryMillis()) {
+                expired.add(task);
+            } else if (leaseState.renewalInProgress() == false && nowMillis >= leaseState.renewAtMillis()) {
+                final LeaseState renewing = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), true);
+                if (task.leaseState.compareAndSet(leaseState, renewing)) {
+                    toRenew.add(new Tuple<>(task, leaseState.lease()));
                 }
             }
         }
 
         expired.forEach(
-            task -> task.leaseLost(new LeaseLostException("lease for task [" + task.leaseState.lease().taskId() + "] has expired"))
+            task -> task.leaseLost(new LeaseLostException("lease for task [" + task.leaseState.get().lease().taskId() + "] has expired"))
         );
-        toRenew.forEach(this::renew);
+        toRenew.forEach(task -> renew(task.v1(), task.v2()));
         scheduleNextLeaseCheck();
     }
 
-    private void renew(ActiveTask task) {
-        final Lease lease;
-        synchronized (this) {
-            if (running == false || active.get(task.taskId()) != task) {
-                return;
-            }
-            lease = task.leaseState.lease();
+    private void renew(ActiveTask task, Lease lease) {
+        if (runtimeState.get().running() == false || active.get(task.taskId()) != task) {
+            return;
         }
         final ActionListener<Lease> listener = ActionListener.assertOnce(
-            ActionListener.wrap(renewedLease -> leaseRenewed(task, lease, renewedLease), e -> leaseRenewalFailed(task, e))
+            ActionListener.wrap(renewedLease -> leaseRenewed(task, lease, renewedLease), e -> leaseRenewalFailed(task, lease, e))
         );
         try {
             queue.renew(lease, leaseDuration, listener);
@@ -353,57 +408,66 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     }
 
     private void leaseRenewed(ActiveTask task, Lease previousLease, Lease renewedLease) {
-        Exception invalidLease = null;
-        synchronized (this) {
-            if (running == false || active.get(task.taskId()) != task) {
-                return;
-            }
-            final LeaseState leaseState = task.leaseState;
-            final long nowMillis = threadPool.absoluteTimeInMillis();
-            if (leaseState.lease() != previousLease
-                || renewedLease == null
-                || sameLeaseIncarnation(previousLease, renewedLease) == false
-                || renewedLease.expiryMillis() <= nowMillis) {
-                task.leaseState = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), false);
-                invalidLease = new LeaseLostException("queue returned an invalid renewed lease for task [" + task.taskId() + "]");
-            } else {
-                task.leaseState = new LeaseState(renewedLease, renewalTime(nowMillis, renewedLease.expiryMillis()), false);
-            }
+        if (runtimeState.get().running() == false || active.get(task.taskId()) != task) {
+            return;
         }
 
-        if (invalidLease == null) {
-            scheduleNextLeaseCheck();
-        } else {
-            task.leaseLost(invalidLease);
+        final long nowMillis = threadPool.absoluteTimeInMillis();
+        final boolean validLease = renewedLease != null
+            && sameLeaseIncarnation(previousLease, renewedLease)
+            && renewedLease.expiryMillis() > nowMillis;
+        final LeaseState previous = task.leaseState.getAndUpdate(leaseState -> {
+            if (leaseState.lease() != previousLease || leaseState.renewalInProgress() == false) {
+                return leaseState;
+            }
+            if (validLease) {
+                return new LeaseState(renewedLease, renewalTime(nowMillis, renewedLease.expiryMillis()), false);
+            }
+            return new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), false);
+        });
+        if (previous.lease() != previousLease || previous.renewalInProgress() == false) {
+            return;
         }
+
+        if (validLease == false) {
+            task.leaseLost(new LeaseLostException("queue returned an invalid renewed lease for task [" + task.taskId() + "]"));
+            return;
+        }
+        scheduleNextLeaseCheck();
     }
 
-    private void leaseRenewalFailed(ActiveTask task, Exception failure) {
-        final boolean loseLease;
-        synchronized (this) {
-            if (running == false || active.get(task.taskId()) != task) {
-                return;
-            }
-            final LeaseState leaseState = task.leaseState;
-            final long nowMillis = threadPool.absoluteTimeInMillis();
-            if (failure instanceof LeaseLostException) {
-                loseLease = true;
-                task.leaseState = new LeaseState(leaseState.lease(), leaseState.lease().expiryMillis(), false);
-            } else if (nowMillis >= leaseState.lease().expiryMillis()) {
-                loseLease = true;
-                task.leaseState = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), false);
-                failure = new LeaseLostException("lease for task [" + task.taskId() + "] has expired", failure);
-            } else {
-                loseLease = false;
-                final long normalRetryMillis = Math.max(1L, leaseDuration.millis() / 10L);
-                final long remainingMillis = leaseState.lease().expiryMillis() - nowMillis;
-                final long renewAtMillis = nowMillis + Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
-                task.leaseState = new LeaseState(leaseState.lease(), renewAtMillis, false);
-            }
+    private void leaseRenewalFailed(ActiveTask task, Lease previousLease, Exception failure) {
+        if (runtimeState.get().running() == false || active.get(task.taskId()) != task) {
+            return;
         }
 
+        final long nowMillis = threadPool.absoluteTimeInMillis();
+        final boolean fenced = failure instanceof LeaseLostException;
+        final LeaseState previous = task.leaseState.getAndUpdate(leaseState -> {
+            if (leaseState.lease() != previousLease || leaseState.renewalInProgress() == false) {
+                return leaseState;
+            }
+            if (fenced) {
+                return new LeaseState(leaseState.lease(), leaseState.lease().expiryMillis(), false);
+            }
+            if (nowMillis >= leaseState.lease().expiryMillis()) {
+                return new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), false);
+            }
+            final long normalRetryMillis = Math.max(1L, leaseDuration.millis() / 10L);
+            final long remainingMillis = leaseState.lease().expiryMillis() - nowMillis;
+            final long renewAtMillis = nowMillis + Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
+            return new LeaseState(leaseState.lease(), renewAtMillis, false);
+        });
+        if (previous.lease() != previousLease || previous.renewalInProgress() == false) {
+            return;
+        }
+
+        final boolean loseLease = fenced || nowMillis >= previous.lease().expiryMillis();
         if (loseLease) {
-            task.leaseLost(failure);
+            final Exception leaseFailure = fenced
+                ? failure
+                : new LeaseLostException("lease for task [" + task.taskId() + "] has expired", failure);
+            task.leaseLost(leaseFailure);
         } else {
             scheduleNextLeaseCheck();
         }
@@ -419,15 +483,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         return nowMillis + Math.max(1L, (expiryMillis - nowMillis) / 2L);
     }
 
-    private void cancelNextLeaseCheck() {
-        leaseCheckGeneration++;
-        if (nextLeaseCheck != null) {
-            nextLeaseCheck.cancel();
-            nextLeaseCheck = null;
-        }
-        nextLeaseCheckAtMillis = Long.MAX_VALUE;
-    }
-
     private void release(ActiveTask task) {
         final ActionListener<Void> listener = ActionListener.assertOnce(
             ActionListener.runAfter(
@@ -439,22 +494,15 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             )
         );
         try {
-            queue.release(task.leaseState.lease(), listener);
+            queue.release(task.leaseState.get().lease(), listener);
         } catch (Exception e) {
             listener.onFailure(e);
         }
     }
 
     private void taskEnded(ActiveTask task) {
-        final boolean refill;
-        synchronized (this) {
-            if (active.get(task.taskId()) == task) {
-                active.remove(task.taskId());
-            }
-            refill = running;
-        }
-        scheduleNextLeaseCheck();
-        if (refill) {
+        if (active.remove(task.taskId(), task)) {
+            scheduleNextLeaseCheck();
             fillCapacity();
         }
     }
@@ -472,7 +520,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     }
 
     // Exposed for tests.
-    synchronized int activeTaskCount() {
+    int activeTaskCount() {
         return active.size();
     }
 
@@ -481,14 +529,13 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         private final String taskId;
 
-        // Replaced while holding TaskProcessorRuntime.this and read by queue operations after an authority check.
-        private volatile LeaseState leaseState;
-
+        // Lease scheduling and processor-visible state change independently.
+        private final AtomicReference<LeaseState> leaseState;
         private final AtomicReference<LocalState<S>> localState;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
             this.taskId = lease.taskId();
-            this.leaseState = new LeaseState(lease, renewAtMillis, false);
+            this.leaseState = new AtomicReference<>(new LeaseState(lease, renewAtMillis, false));
             this.localState = new AtomicReference<>(new LocalState<>(state, false, false, null));
         }
 
