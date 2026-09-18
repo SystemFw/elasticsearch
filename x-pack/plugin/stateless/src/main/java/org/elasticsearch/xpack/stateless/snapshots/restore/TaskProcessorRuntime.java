@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.stateless.snapshots.restore;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.core.Tuple;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.threadpool.Scheduler;
@@ -17,7 +18,6 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
-import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeasedTask;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -123,7 +123,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             claimInProgress = true;
         }
 
-        final ActionListener<List<LeasedTask<S>>> listener = ActionListener.assertOnce(
+        final ActionListener<List<Tuple<S, Lease>>> listener = ActionListener.assertOnce(
             ActionListener.wrap(this::claimsCompleted, this::claimFailed)
         );
         try {
@@ -133,7 +133,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
     }
 
-    private void claimsCompleted(List<LeasedTask<S>> claimedTasks) {
+    private void claimsCompleted(List<Tuple<S, Lease>> claimedTasks) {
         Objects.requireNonNull(claimedTasks);
         final List<TaskHandleImpl> toStart = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
@@ -142,21 +142,20 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         synchronized (this) {
             claimInProgress = false;
             if (running == false) {
-                claimedTasks.forEach(task -> toRelease.add(task.lease()));
+                claimedTasks.forEach(task -> toRelease.add(task.v2()));
             } else {
                 int remainingCapacity = maxConcurrentTasks - active.size();
                 final long nowMillis = threadPool.absoluteTimeInMillis();
-                for (LeasedTask<S> task : claimedTasks) {
-                    if (remainingCapacity > 0
-                        && active.containsKey(task.lease().taskId()) == false
-                        && task.lease().expiryMillis() > nowMillis) {
-                        var handle = new TaskHandleImpl(task.lease().taskId(), task.state());
-                        var activeTask = new ActiveTask(handle, task.lease(), renewalTime(nowMillis, task.lease().expiryMillis()));
-                        active.put(task.lease().taskId(), activeTask);
+                for (Tuple<S, Lease> task : claimedTasks) {
+                    final Lease lease = task.v2();
+                    if (remainingCapacity > 0 && active.containsKey(lease.taskId()) == false && lease.expiryMillis() > nowMillis) {
+                        var handle = new TaskHandleImpl(lease.taskId(), task.v1());
+                        var activeTask = new ActiveTask(handle, lease, renewalTime(nowMillis, lease.expiryMillis()));
+                        active.put(lease.taskId(), activeTask);
                         toStart.add(handle);
                         remainingCapacity--;
                     } else {
-                        toRelease.add(task.lease());
+                        toRelease.add(lease);
                     }
                 }
             }
@@ -412,7 +411,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 loseLease = false;
                 final long normalRetryMillis = Math.max(1L, leaseDuration.millis() / 10L);
                 final long remainingMillis = task.lease.expiryMillis() - nowMillis;
-                task.renewAtMillis = nowMillis + Math.min(normalRetryMillis, Math.max(1L, remainingMillis / 2L));
+                task.renewAtMillis = nowMillis + Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
             }
         }
 
@@ -506,8 +505,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         private ActionListener<S> pendingStateListener;
 
         private TaskHandleImpl(String taskId, S state) {
-            this.taskId = Objects.requireNonNull(taskId);
-            this.state = Objects.requireNonNull(state);
+            this.taskId = taskId;
+            this.state = state;
         }
 
         private String taskId() {

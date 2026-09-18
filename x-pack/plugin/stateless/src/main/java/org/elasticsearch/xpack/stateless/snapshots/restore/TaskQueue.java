@@ -9,9 +9,9 @@ package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.core.Tuple;
 
 import java.util.List;
-import java.util.Objects;
 
 /**
  * Durable queue operations needed by {@link TaskProcessorRuntime}. Implementations must validate the lease identity for every operation
@@ -28,38 +28,7 @@ public interface TaskQueue<S> {
      * @param fencingToken the generation checked by every operation under the lease
      * @param expiryMillis the absolute time at which the lease loses authority
      */
-    record Lease(String taskId, String ownerId, long fencingToken, long expiryMillis) {
-
-        public Lease {
-            Objects.requireNonNull(taskId);
-            Objects.requireNonNull(ownerId);
-            if (fencingToken < 0L) {
-                throw new IllegalArgumentException("fencing token must be non-negative");
-            }
-            if (expiryMillis < 0L) {
-                throw new IllegalArgumentException("expiry time must be non-negative");
-            }
-        }
-    }
-
-    /**
-     * A task and the lease under which it may be processed.
-     *
-     * @param id the durable task identifier
-     * @param state the task-specific persistent state
-     * @param lease the lease acquired for this processing attempt
-     */
-    record LeasedTask<S>(String id, S state, Lease lease) {
-
-        public LeasedTask {
-            Objects.requireNonNull(id);
-            Objects.requireNonNull(state);
-            Objects.requireNonNull(lease);
-            if (id.equals(lease.taskId()) == false) {
-                throw new IllegalArgumentException("task ID [" + id + "] does not match lease task ID [" + lease.taskId() + "]");
-            }
-        }
-    }
+    record Lease(String taskId, String ownerId, long fencingToken, long expiryMillis) {}
 
     /** Indicates that an operation was rejected because its lease no longer owns the task. */
     class LeaseLostException extends RuntimeException {
@@ -76,7 +45,7 @@ public interface TaskQueue<S> {
     }
 
     /** Claims up to {@code maxTasks} tasks for {@code ownerId}. */
-    void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<LeasedTask<S>>> listener);
+    void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<Tuple<S, Lease>>> listener);
 
     /** Renews a live lease and returns its new expiry. */
     void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener);

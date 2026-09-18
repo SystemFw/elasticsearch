@@ -10,11 +10,11 @@ package org.elasticsearch.xpack.stateless.snapshots.restore;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
-import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeasedTask;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -262,7 +262,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private boolean deferFinishes;
         private boolean completeRenewals = true;
         private boolean failRenewalsWithLeaseLoss;
-        private ActionListener<List<LeasedTask<String>>> pendingClaim;
+        private ActionListener<List<Tuple<String, Lease>>> pendingClaim;
         private PendingModification pendingModification;
         private ActionListener<String> pendingFinish;
 
@@ -276,7 +276,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<LeasedTask<String>>> listener) {
+        public void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<Tuple<String, Lease>>> listener) {
             if (deferClaims) {
                 assertNull(pendingClaim);
                 pendingClaim = listener;
@@ -291,8 +291,8 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             listener.onResponse(claimTasks("worker", 1, TimeValue.timeValueMillis(100)));
         }
 
-        private List<LeasedTask<String>> claimTasks(String ownerId, int maxTasks, TimeValue leaseDuration) {
-            var result = new ArrayList<LeasedTask<String>>();
+        private List<Tuple<String, Lease>> claimTasks(String ownerId, int maxTasks, TimeValue leaseDuration) {
+            var result = new ArrayList<Tuple<String, Lease>>();
             while (result.size() < maxTasks && readyTasks.isEmpty() == false) {
                 var task = readyTasks.remove();
                 var lease = new Lease(
@@ -301,7 +301,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
                     nextFencingToken++,
                     deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
                 );
-                result.add(new LeasedTask<>(task.getKey(), states.get(task.getKey()), lease));
+                result.add(new Tuple<>(states.get(task.getKey()), lease));
             }
             return result;
         }
