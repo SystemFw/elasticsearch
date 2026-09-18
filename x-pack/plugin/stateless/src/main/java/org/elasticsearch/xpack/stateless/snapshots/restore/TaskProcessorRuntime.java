@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Runs a processor against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management.
@@ -50,6 +51,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private Scheduler.Cancellable nextLeaseCheck;
     private long nextLeaseCheckAtMillis = Long.MAX_VALUE;
     private long leaseCheckGeneration;
+
+    private record LocalState<T>(T state, boolean closed, boolean terminalUpdate, ActionListener<T> updateListener) {}
 
     /** Creates a runtime for one task type and processor. */
     public TaskProcessorRuntime(
@@ -387,9 +390,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             task.renewalInProgress = false;
             final long nowMillis = threadPool.absoluteTimeInMillis();
             if (failure instanceof LeaseLostException) {
-                synchronized (task) {
-                    loseLease = task.terminalUpdateInProgress == false;
-                }
+                loseLease = task.localState.get().terminalUpdate() == false;
                 task.renewAtMillis = task.lease.expiryMillis();
                 if (loseLease == false) {
                     task.deferredLeaseLoss = failure;
@@ -492,30 +493,26 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         private boolean renewalInProgress;
         private Exception deferredLeaseLoss;
 
-        // The following fields are guarded by this.
-        private S state;
-        private boolean closed;
-        private boolean terminalUpdateInProgress;
-        private ActionListener<S> pendingUpdateListener;
+        private final AtomicReference<LocalState<S>> localState;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
             this.taskId = lease.taskId();
-            this.state = state;
             this.lease = lease;
             this.renewAtMillis = renewAtMillis;
+            this.localState = new AtomicReference<>(new LocalState<>(state, false, false, null));
         }
 
         private String taskId() {
             return taskId;
         }
 
-        private synchronized boolean canProcess() {
-            return closed == false;
+        private boolean canProcess() {
+            return localState.get().closed() == false;
         }
 
         @Override
-        public synchronized S state() {
-            return state;
+        public S state() {
+            return localState.get().state();
         }
 
         @Override
@@ -523,68 +520,62 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             Objects.requireNonNull(newState);
             Objects.requireNonNull(listener);
 
-            final Exception rejection;
-            synchronized (this) {
-                if (closed) {
-                    rejection = new LeaseLostException("lease for task [" + taskId + "] is no longer active");
-                } else if (pendingUpdateListener != null) {
-                    rejection = new IllegalStateException("task [" + taskId + "] already has a persistent state change in progress");
-                } else {
-                    terminalUpdateInProgress = terminal;
-                    pendingUpdateListener = listener;
-                    rejection = null;
-                }
+            final LocalState<S> current = localState.get();
+            if (current.closed()) {
+                listener.onFailure(new LeaseLostException("lease for task [" + taskId + "] is no longer active"));
+                return;
+            }
+            if (current.updateListener() != null) {
+                listener.onFailure(new IllegalStateException("task [" + taskId + "] already has a persistent state change in progress"));
+                return;
             }
 
-            if (rejection != null) {
-                listener.onFailure(rejection);
+            final LocalState<S> pendingUpdate = new LocalState<>(current.state(), false, terminal, listener);
+            final LocalState<S> witness = localState.compareAndExchange(current, pendingUpdate);
+            if (witness != current) {
+                final Exception failure = witness.closed()
+                    ? new LeaseLostException("lease for task [" + taskId + "] is no longer active")
+                    : new IllegalStateException("task [" + taskId + "] changed concurrently while starting a persistent state change");
+                listener.onFailure(failure);
                 return;
             }
 
             final ActionListener<S> operationListener = ActionListener.assertOnce(
-                ActionListener.wrap(this::stateChangeCompleted, this::stateChangeFailed)
+                ActionListener.wrap(
+                    persistedState -> stateChangeCompleted(pendingUpdate, persistedState),
+                    failure -> stateChangeFailed(pendingUpdate, failure)
+                )
             );
             TaskProcessorRuntime.this.update(this, newState, terminal, operationListener);
         }
 
-        private void stateChangeCompleted(S persistedState) {
-            final ActionListener<S> listener;
-            final boolean finished;
-            synchronized (this) {
-                if (pendingUpdateListener == null) {
-                    return;
-                }
-
-                state = Objects.requireNonNull(persistedState);
-                listener = pendingUpdateListener;
-                pendingUpdateListener = null;
-                finished = terminalUpdateInProgress;
-                terminalUpdateInProgress = false;
-                closed = finished;
+        private void stateChangeCompleted(LocalState<S> pendingUpdate, S persistedState) {
+            final LocalState<S> completed = new LocalState<>(
+                Objects.requireNonNull(persistedState),
+                pendingUpdate.terminalUpdate(),
+                false,
+                null
+            );
+            if (localState.compareAndSet(pendingUpdate, completed) == false) {
+                return;
             }
 
-            if (finished) {
+            if (completed.closed()) {
                 taskEnded(this);
             }
-            listener.onResponse(persistedState);
+            pendingUpdate.updateListener().onResponse(persistedState);
         }
 
-        private void stateChangeFailed(Exception failure) {
+        private void stateChangeFailed(LocalState<S> pendingUpdate, Exception failure) {
             if (failure instanceof LeaseLostException) {
                 leaseLost(failure);
                 return;
             }
 
-            final ActionListener<S> listener;
-            synchronized (this) {
-                if (pendingUpdateListener == null) {
-                    return;
-                }
-                listener = pendingUpdateListener;
-                pendingUpdateListener = null;
-                terminalUpdateInProgress = false;
+            final LocalState<S> failed = new LocalState<>(pendingUpdate.state(), false, false, null);
+            if (localState.compareAndSet(pendingUpdate, failed)) {
+                pendingUpdate.updateListener().onFailure(failure);
             }
-            listener.onFailure(failure);
         }
 
         private void processorFailed(Exception failure) {
@@ -593,41 +584,33 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
 
         private boolean runtimeStopped() {
-            final ActionListener<S> listener;
-            synchronized (this) {
-                if (closed) {
-                    return false;
-                }
-                closed = true;
-                listener = pendingUpdateListener;
-                pendingUpdateListener = null;
-                terminalUpdateInProgress = false;
+            final LocalState<S> previous = localState.getAndUpdate(
+                current -> current.closed() ? current : new LocalState<>(current.state(), true, false, null)
+            );
+            if (previous.closed()) {
+                return false;
             }
 
             final var failure = new LeaseLostException("runtime stopped while processing task [" + taskId + "]");
             cancelTask(this);
-            if (listener != null) {
-                notifyStateFailure(listener, failure);
+            if (previous.updateListener() != null) {
+                notifyStateFailure(previous.updateListener(), failure);
             }
             return true;
         }
 
         private void leaseLost(Exception failure) {
-            final ActionListener<S> listener;
-            synchronized (this) {
-                if (closed) {
-                    return;
-                }
-                closed = true;
-                listener = pendingUpdateListener;
-                pendingUpdateListener = null;
-                terminalUpdateInProgress = false;
+            final LocalState<S> previous = localState.getAndUpdate(
+                current -> current.closed() ? current : new LocalState<>(current.state(), true, false, null)
+            );
+            if (previous.closed()) {
+                return;
             }
 
             cancelTask(this);
             taskEnded(this);
-            if (listener != null) {
-                notifyStateFailure(listener, failure);
+            if (previous.updateListener() != null) {
+                notifyStateFailure(previous.updateListener(), failure);
             }
         }
 
