@@ -387,7 +387,9 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             task.renewalInProgress = false;
             final long nowMillis = threadPool.absoluteTimeInMillis();
             if (failure instanceof LeaseLostException) {
-                loseLease = task.hasTerminalUpdateInProgress() == false;
+                synchronized (task) {
+                    loseLease = task.terminalUpdateInProgress == false;
+                }
                 task.renewAtMillis = task.lease.expiryMillis();
                 if (loseLease == false) {
                     task.deferredLeaseLoss = failure;
@@ -431,7 +433,13 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
     private void release(ActiveTask task) {
         final ActionListener<Void> listener = ActionListener.assertOnce(
-            ActionListener.wrap(ignored -> task.releaseCompleted(null), task::releaseCompleted)
+            ActionListener.runAfter(
+                ActionListener.wrap(
+                    ignored -> {},
+                    failure -> logger.debug(() -> "failed to release lease for task [" + task.taskId() + "]", failure)
+                ),
+                () -> taskEnded(task)
+            )
         );
         try {
             queue.release(task.lease, listener);
@@ -503,10 +511,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         private synchronized boolean canProcess() {
             return closed == false;
-        }
-
-        private synchronized boolean hasTerminalUpdateInProgress() {
-            return terminalUpdateInProgress;
         }
 
         @Override
@@ -606,13 +610,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 notifyStateFailure(listener, failure);
             }
             return true;
-        }
-
-        private void releaseCompleted(Exception failure) {
-            if (failure != null) {
-                logger.debug(() -> "failed to release lease for task [" + taskId + "]", failure);
-            }
-            taskEnded(this);
         }
 
         private void leaseLost(Exception failure) {
