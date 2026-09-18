@@ -163,7 +163,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                     }
                 }
             }
-            shouldPollLater = running && toStart.isEmpty();
+            shouldPollLater = running && active.size() < maxConcurrentTasks;
         }
 
         toRelease.forEach(this::releaseUnstartedLease);
@@ -172,8 +172,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         if (shouldPollLater) {
             scheduleNextClaim();
-        } else {
-            fillCapacity();
         }
     }
 

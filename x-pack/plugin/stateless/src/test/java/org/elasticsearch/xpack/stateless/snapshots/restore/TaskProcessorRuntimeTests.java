@@ -93,6 +93,20 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
+    public void testPartialClaimWaitsBeforePollingAgain() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> {}, ignored -> {}), 2);
+
+        runtime.start();
+
+        assertThat(queue.claimCount, equalTo(1));
+
+        runtime.stop();
+        runtime.close();
+    }
+
     public void testHangingRenewalLosesLeaseAtLastConfirmedExpiry() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
@@ -228,6 +242,15 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         TestTaskQueue queue,
         Task<String> processor
     ) {
+        return newRuntime(deterministicTaskQueue, queue, processor, 1);
+    }
+
+    private static TaskProcessorRuntime<String> newRuntime(
+        DeterministicTaskQueue deterministicTaskQueue,
+        TestTaskQueue queue,
+        Task<String> processor,
+        int maxConcurrentTasks
+    ) {
         var threadPool = deterministicTaskQueue.getThreadPool();
         return new TaskProcessorRuntime<>(
             queue,
@@ -235,7 +258,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             threadPool,
             threadPool.generic(),
             "worker",
-            1,
+            maxConcurrentTasks,
             TimeValue.timeValueMillis(100),
             TimeValue.timeValueSeconds(1)
         );
@@ -262,6 +285,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private final Map<String, String> states = new HashMap<>();
         private final List<Lease> renewedLeases = new ArrayList<>();
         private final List<Lease> releasedLeases = new ArrayList<>();
+        private int claimCount;
         private long nextFencingToken;
         private boolean deferClaims;
         private boolean deferModifications;
@@ -283,6 +307,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
 
         @Override
         public void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<Tuple<String, Lease>>> listener) {
+            claimCount++;
             if (deferClaims) {
                 assertNull(pendingClaim);
                 pendingClaim = listener;
