@@ -5,7 +5,7 @@
  * 2.0.
  */
 
-package org.elasticsearch.xpack.stateless.snapshots;
+package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
@@ -14,10 +14,10 @@ import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.threadpool.Scheduler;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.xpack.stateless.snapshots.Task.TaskHandle;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Lease;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeasedTask;
+import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeasedTask;
 
 import java.util.ArrayList;
 import java.util.HashMap;

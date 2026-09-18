@@ -5,7 +5,7 @@
  * 2.0.
  */
 
-package org.elasticsearch.xpack.stateless.snapshots;
+package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
 

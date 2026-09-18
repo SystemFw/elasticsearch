@@ -5,16 +5,16 @@
  * 2.0.
  */
 
-package org.elasticsearch.xpack.stateless.snapshots;
+package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.test.ESTestCase;
-import org.elasticsearch.xpack.stateless.snapshots.Task.TaskHandle;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Lease;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeasedTask;
+import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeasedTask;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;

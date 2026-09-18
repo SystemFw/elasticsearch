@@ -329,4 +329,3 @@ At minimum, tests must cover:
 * Whether the activation marker is retained permanently as provenance or cleaned up after `DONE`.
 * The exact completion condition: activation committed, primaries started, or all configured shard copies started.
 * Which node roles are eligible to coordinate and perform transfer work.
-
