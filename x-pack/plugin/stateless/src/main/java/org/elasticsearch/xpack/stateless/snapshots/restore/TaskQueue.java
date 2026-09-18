@@ -14,9 +14,12 @@ import org.elasticsearch.core.Tuple;
 import java.util.List;
 
 /**
- * Durable queue operations needed by {@link TaskProcessorRuntime}. Implementations must validate the lease identity for every operation
- * other than {@link #claim}. Renewal and state changes must additionally require the task to be running; release may also recognize an
- * already-released lease to provide idempotence.
+ * Durable queue operations needed by {@link TaskProcessorRuntime}. A nonterminal task is available to claim when it has no lease or its
+ * lease has expired. A task with a live lease and a terminal task are not available to claim.
+ * <p>
+ * Implementations must validate the lease identity for every operation other than {@link #claim}. Renewal and state changes must also
+ * require the task to be nonterminal. Finishing a task atomically stores its final state, makes it terminal, and removes its lease. The
+ * final state determines whether the terminal outcome represents success or failure.
  */
 public interface TaskQueue<S> {
 
@@ -44,7 +47,7 @@ public interface TaskQueue<S> {
         }
     }
 
-    /** Claims up to {@code maxTasks} tasks for {@code ownerId}. */
+    /** Claims up to {@code maxTasks} available tasks for {@code ownerId}, replacing any expired leases. */
     void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<Tuple<S, Lease>>> listener);
 
     /** Renews a live lease and returns its new expiry. */
@@ -53,7 +56,7 @@ public interface TaskQueue<S> {
     /** Replaces the task-specific persistent state while retaining the lease. */
     void modify(Lease lease, S newState, ActionListener<S> listener);
 
-    /** Replaces the task-specific persistent state and makes the task terminal. */
+    /** Replaces the task-specific persistent state, makes the task terminal, and removes its lease. */
     void finish(Lease lease, S finalState, ActionListener<S> listener);
 
     /**

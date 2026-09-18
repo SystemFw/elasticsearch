@@ -485,14 +485,9 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     /** Holds the runtime and processor-facing state for one lease incarnation. */
     private final class ActiveTask implements TaskHandle<S> {
 
-        private enum Status {
-            ACTIVE,
-            MODIFYING,
-            FINISHING,
-            RELEASING,
-            LEASE_LOST,
-            FINISHED,
-            RELEASED
+        private enum ChangeType {
+            MODIFY,
+            FINISH
         }
 
         private final String taskId;
@@ -507,8 +502,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         // The following fields are guarded by this.
         private S state;
-        private Status status = Status.ACTIVE;
-        private ActionListener<S> pendingStateListener;
+        private boolean closed;
+        private PendingChange pendingChange;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
             this.taskId = lease.taskId();
@@ -522,11 +517,11 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
 
         private synchronized boolean canProcess() {
-            return isLive(status);
+            return closed == false;
         }
 
         private synchronized boolean isFinishing() {
-            return status == Status.FINISHING;
+            return pendingChange != null && pendingChange.type == ChangeType.FINISH;
         }
 
         @Override
@@ -536,26 +531,31 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         @Override
         public void modify(S newState, ActionListener<S> listener) {
-            changeState(newState, Status.MODIFYING, listener);
+            changeState(newState, ChangeType.MODIFY, listener);
         }
 
         @Override
         public void finish(S finalState, ActionListener<S> listener) {
-            changeState(finalState, Status.FINISHING, listener);
+            changeState(finalState, ChangeType.FINISH, listener);
         }
 
-        private void changeState(S newState, Status operation, ActionListener<S> listener) {
+        private void changeState(S newState, ChangeType type, ActionListener<S> listener) {
             Objects.requireNonNull(newState);
             Objects.requireNonNull(listener);
 
             final Exception rejection;
+            final PendingChange change;
             synchronized (this) {
-                if (status == Status.ACTIVE) {
-                    status = operation;
-                    pendingStateListener = listener;
-                    rejection = null;
+                if (closed) {
+                    change = null;
+                    rejection = new LeaseLostException("lease for task [" + taskId + "] is no longer active");
+                } else if (pendingChange != null) {
+                    change = null;
+                    rejection = new IllegalStateException("task [" + taskId + "] already has a persistent state change in progress");
                 } else {
-                    rejection = operationRejection();
+                    change = new PendingChange(type, listener);
+                    pendingChange = change;
+                    rejection = null;
                 }
             }
 
@@ -565,63 +565,47 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             }
 
             final ActionListener<S> operationListener = ActionListener.assertOnce(
-                ActionListener.wrap(persistedState -> stateChangeCompleted(operation, persistedState), this::stateChangeFailed)
+                ActionListener.wrap(persistedState -> stateChangeCompleted(change, persistedState), e -> stateChangeFailed(change, e))
             );
-            if (operation == Status.MODIFYING) {
+            if (type == ChangeType.MODIFY) {
                 TaskProcessorRuntime.this.modify(this, newState, operationListener);
             } else {
                 TaskProcessorRuntime.this.finish(this, newState, operationListener);
             }
         }
 
-        private Exception operationRejection() {
-            return switch (status) {
-                case RELEASING, LEASE_LOST, RELEASED -> new LeaseLostException("lease for task [" + taskId + "] is no longer active");
-                case FINISHED -> new IllegalStateException("task [" + taskId + "] is already finished");
-                case MODIFYING, FINISHING -> new IllegalStateException(
-                    "task [" + taskId + "] already has a persistent state change in progress"
-                );
-                case ACTIVE -> throw new AssertionError("active task must accept the operation");
-            };
-        }
-
-        private void stateChangeCompleted(Status operation, S persistedState) {
-            final ActionListener<S> listener;
+        private void stateChangeCompleted(PendingChange change, S persistedState) {
             final boolean finished;
             synchronized (this) {
-                if (status != operation) {
+                if (pendingChange != change) {
                     return;
                 }
 
                 state = Objects.requireNonNull(persistedState);
-                listener = pendingStateListener;
-                pendingStateListener = null;
-                finished = operation == Status.FINISHING;
-                status = finished ? Status.FINISHED : Status.ACTIVE;
+                pendingChange = null;
+                finished = change.type == ChangeType.FINISH;
+                closed = finished;
             }
 
             if (finished) {
                 taskEnded(this);
             }
-            listener.onResponse(persistedState);
+            change.listener.onResponse(persistedState);
         }
 
-        private void stateChangeFailed(Exception failure) {
+        private void stateChangeFailed(PendingChange change, Exception failure) {
             if (failure instanceof LeaseLostException) {
                 leaseLost(failure);
                 return;
             }
 
-            final ActionListener<S> listener;
             synchronized (this) {
-                if (status != Status.MODIFYING && status != Status.FINISHING) {
+                if (pendingChange != change) {
                     return;
                 }
-                status = Status.ACTIVE;
-                listener = pendingStateListener;
-                pendingStateListener = null;
+                pendingChange = null;
             }
-            listener.onFailure(failure);
+            change.listener.onFailure(failure);
         }
 
         private void processorFailed(Exception failure) {
@@ -630,31 +614,25 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
 
         private boolean runtimeStopped() {
-            final ActionListener<S> stateListener;
+            final PendingChange change;
             synchronized (this) {
-                if (isTerminal(status)) {
+                if (closed) {
                     return false;
                 }
-                status = Status.RELEASING;
-                stateListener = pendingStateListener;
-                pendingStateListener = null;
+                closed = true;
+                change = pendingChange;
+                pendingChange = null;
             }
 
             final var failure = new LeaseLostException("runtime stopped while processing task [" + taskId + "]");
             cancelTask(this);
-            if (stateListener != null) {
-                notifyStateFailure(stateListener, failure);
+            if (change != null) {
+                notifyStateFailure(change.listener, failure);
             }
             return true;
         }
 
         private void releaseCompleted(Exception failure) {
-            synchronized (this) {
-                if (status != Status.RELEASING) {
-                    return;
-                }
-                status = Status.RELEASED;
-            }
             if (failure != null) {
                 logger.debug(() -> "failed to release lease for task [" + taskId + "]", failure);
             }
@@ -662,20 +640,20 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
 
         private void leaseLost(Exception failure) {
-            final ActionListener<S> stateListener;
+            final PendingChange change;
             synchronized (this) {
-                if (isTerminal(status)) {
+                if (closed) {
                     return;
                 }
-                status = Status.LEASE_LOST;
-                stateListener = pendingStateListener;
-                pendingStateListener = null;
+                closed = true;
+                change = pendingChange;
+                pendingChange = null;
             }
 
             cancelTask(this);
             taskEnded(this);
-            if (stateListener != null) {
-                notifyStateFailure(stateListener, failure);
+            if (change != null) {
+                notifyStateFailure(change.listener, failure);
             }
         }
 
@@ -687,12 +665,14 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             }
         }
 
-        private static boolean isLive(Status status) {
-            return status == Status.ACTIVE || status == Status.MODIFYING || status == Status.FINISHING;
-        }
+        private final class PendingChange {
+            private final ChangeType type;
+            private final ActionListener<S> listener;
 
-        private static boolean isTerminal(Status status) {
-            return status == Status.RELEASING || status == Status.LEASE_LOST || status == Status.FINISHED || status == Status.RELEASED;
+            private PendingChange(ChangeType type, ActionListener<S> listener) {
+                this.type = type;
+                this.listener = listener;
+            }
         }
     }
 }

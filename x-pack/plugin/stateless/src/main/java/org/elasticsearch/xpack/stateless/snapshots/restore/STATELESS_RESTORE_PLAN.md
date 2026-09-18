@@ -114,19 +114,22 @@ Each shard task records at least:
 * Restore UUID and plan version.
 * Source repository UUID, snapshot UUID, source index ID, snapshot shard generation, and shard number.
 * Destination project, index UUID, shard number, and object prefix.
-* Task state, attempt count, and retry time.
+* Task-specific state, terminal outcome, attempt count, and retry time.
 * Lease owner, random lease ID, and expiry.
 * Source-file plan or a digest of that plan.
 * Upload identity and provider-specific resumability information where necessary.
 * Logical bytes, transferred bytes, and timestamps for observability.
 * Published BCC objects, checksums, format version, and terminal failure information.
 
-Suggested task states are `PENDING`, `RUNNING`, `VERIFYING`, `SUCCESS`, `RETRY_WAIT`, `FAILED`, and `CANCELLED`.
+Queue lifecycle is represented by terminality and an optional lease rather than by a shared task-state enum. A nonterminal task is
+available when it has no lease or its lease has expired, subject to any retry time in its task-specific state. A nonterminal task with a
+live lease and every terminal task are unavailable. The final task-specific state records whether the terminal outcome is success or
+failure.
 
-Workers find pending tasks and expired nonterminal leases through searches. Claiming, renewing, reclaiming, and completing a task uses an
-atomic scripted update that checks fields such as state, `lease_id`, and `lease_expiry`. Native `_seq_no`/`_primary_term` optimistic
-concurrency control may additionally be used when claiming a document returned by a search, but field-based lease checks are implemented
-by scripts executing atomically on the primary shard.
+Workers find available tasks through searches. Claiming, renewing, reclaiming, modifying, releasing, and finishing a task uses an atomic
+scripted update that checks terminality, lease identity, and lease expiry. Finishing atomically stores the final state, marks the task
+terminal, and removes its lease. Native `_seq_no`/`_primary_term` optimistic concurrency control may additionally be used when claiming a
+document returned by a search, but field-based lease checks are implemented by scripts executing atomically on the primary shard.
 
 Document-level fencing does not fence object-store writes. Each attempt must therefore write immutable content-addressed objects or use a
 lease-specific staging prefix. Only the current lease holder can make its uploaded objects authoritative by successfully publishing their
