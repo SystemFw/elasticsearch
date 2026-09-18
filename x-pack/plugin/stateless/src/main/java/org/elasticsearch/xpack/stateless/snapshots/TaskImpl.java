@@ -10,16 +10,14 @@ package org.elasticsearch.xpack.stateless.snapshots;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
+import org.elasticsearch.xpack.stateless.snapshots.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Task;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Objects;
 import java.util.function.Consumer;
 
 /** Implements the processor-facing state machine for one lease incarnation. */
-final class TaskImpl<S> implements Task<S> {
+final class TaskImpl<S> implements TaskHandle<S> {
 
     private static final Logger logger = LogManager.getLogger(TaskImpl.class);
 
@@ -41,18 +39,19 @@ final class TaskImpl<S> implements Task<S> {
 
     private final String taskId;
     private final Operations<S> operations;
+    private final Consumer<TaskImpl<S>> onCancelled;
     private final Consumer<TaskImpl<S>> onEnded;
-    private final List<Runnable> leaseLostListeners = new ArrayList<>();
 
     // The following fields are guarded by this.
     private S state;
     private Status status = Status.ACTIVE;
     private ActionListener<S> pendingStateListener;
 
-    TaskImpl(String taskId, S state, Operations<S> operations, Consumer<TaskImpl<S>> onEnded) {
+    TaskImpl(String taskId, S state, Operations<S> operations, Consumer<TaskImpl<S>> onCancelled, Consumer<TaskImpl<S>> onEnded) {
         this.taskId = Objects.requireNonNull(taskId);
         this.state = Objects.requireNonNull(state);
         this.operations = Objects.requireNonNull(operations);
+        this.onCancelled = Objects.requireNonNull(onCancelled);
         this.onEnded = Objects.requireNonNull(onEnded);
     }
 
@@ -167,21 +166,6 @@ final class TaskImpl<S> implements Task<S> {
         listener.onFailure(failure);
     }
 
-    @Override
-    public void addLeaseLostListener(Runnable listener) {
-        Objects.requireNonNull(listener);
-        final boolean notifyNow;
-        synchronized (this) {
-            notifyNow = status == Status.RELEASING || status == Status.LEASE_LOST || status == Status.RELEASED;
-            if (notifyNow == false && status != Status.FINISHED) {
-                leaseLostListeners.add(listener);
-            }
-        }
-        if (notifyNow) {
-            runLeaseLostListener(listener);
-        }
-    }
-
     void processorFailed(Exception failure) {
         logger.warn(() -> "task processor failed unexpectedly for task [" + taskId + "]", failure);
         leaseLost(new LeaseLostException("task processor failed for task [" + taskId + "]", failure));
@@ -189,7 +173,6 @@ final class TaskImpl<S> implements Task<S> {
 
     boolean runtimeStopped() {
         final ActionListener<S> stateListener;
-        final List<Runnable> listeners;
         synchronized (this) {
             if (isTerminal(status)) {
                 return false;
@@ -197,14 +180,13 @@ final class TaskImpl<S> implements Task<S> {
             status = Status.RELEASING;
             stateListener = pendingStateListener;
             pendingStateListener = null;
-            listeners = takeLeaseLostListeners();
         }
 
         final var failure = new LeaseLostException("runtime stopped while processing task [" + taskId + "]");
+        onCancelled.accept(this);
         if (stateListener != null) {
             notifyStateFailure(stateListener, failure);
         }
-        listeners.forEach(this::runLeaseLostListener);
         return true;
     }
 
@@ -223,7 +205,6 @@ final class TaskImpl<S> implements Task<S> {
 
     void leaseLost(Exception failure) {
         final ActionListener<S> stateListener;
-        final List<Runnable> listeners;
         synchronized (this) {
             if (isTerminal(status)) {
                 return;
@@ -231,14 +212,13 @@ final class TaskImpl<S> implements Task<S> {
             status = Status.LEASE_LOST;
             stateListener = pendingStateListener;
             pendingStateListener = null;
-            listeners = takeLeaseLostListeners();
         }
 
+        onCancelled.accept(this);
         onEnded.accept(this);
         if (stateListener != null) {
             notifyStateFailure(stateListener, failure);
         }
-        listeners.forEach(this::runLeaseLostListener);
     }
 
     private void notifyStateFailure(ActionListener<S> listener, Exception failure) {
@@ -246,20 +226,6 @@ final class TaskImpl<S> implements Task<S> {
             listener.onFailure(failure);
         } catch (Exception e) {
             logger.warn(() -> "state-change listener failed while handling lease loss for task [" + taskId + "]", e);
-        }
-    }
-
-    private List<Runnable> takeLeaseLostListeners() {
-        final List<Runnable> listeners = List.copyOf(leaseLostListeners);
-        leaseLostListeners.clear();
-        return listeners;
-    }
-
-    private void runLeaseLostListener(Runnable listener) {
-        try {
-            listener.run();
-        } catch (Exception e) {
-            logger.warn(() -> "lease-lost listener failed for task [" + taskId + "]", e);
         }
     }
 

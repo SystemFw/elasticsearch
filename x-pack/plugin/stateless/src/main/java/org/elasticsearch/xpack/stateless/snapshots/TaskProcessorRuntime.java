@@ -17,7 +17,6 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeasedTask;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Task;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -25,7 +24,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
-import java.util.function.Consumer;
 
 /**
  * Runs a processor against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management.
@@ -35,7 +33,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
     private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
 
     private final TaskQueue<S> queue;
-    private final Consumer<Task<S>> processor;
+    private final Task<S> processor;
     private final ThreadPool threadPool;
     private final Executor processorExecutor;
     private final String workerId;
@@ -55,7 +53,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
     /** Creates a runtime for one task type and processor. */
     public TaskProcessorRuntime(
         TaskQueue<S> queue,
-        Consumer<Task<S>> processor,
+        Task<S> processor,
         ThreadPool threadPool,
         Executor processorExecutor,
         String workerId,
@@ -151,7 +149,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
                     if (remainingCapacity > 0
                         && active.containsKey(task.lease().taskId()) == false
                         && task.lease().expiryMillis() > nowMillis) {
-                        var execution = new TaskImpl<>(task.lease().taskId(), task.state(), this, this::executionEnded);
+                        var execution = new TaskImpl<>(task.lease().taskId(), task.state(), this, this::cancelTask, this::executionEnded);
                         var activeTask = new ActiveTask<>(execution, task.lease(), renewalTime(nowMillis, task.lease().expiryMillis()));
                         active.put(task.lease().taskId(), activeTask);
                         toStart.add(execution);
@@ -221,13 +219,21 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
                     return;
                 }
                 try {
-                    processor.accept(execution);
+                    processor.process(execution);
                 } catch (Exception e) {
                     execution.processorFailed(e);
                 }
             });
         } catch (Exception e) {
             execution.processorFailed(e);
+        }
+    }
+
+    private void cancelTask(TaskImpl<S> task) {
+        try {
+            processor.cancel(task);
+        } catch (Exception e) {
+            logger.warn(() -> "task processor failed to cancel task [" + task.taskId() + "]", e);
         }
     }
 

@@ -11,10 +11,10 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.xpack.stateless.snapshots.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeasedTask;
-import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Task;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -35,7 +35,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
         queue.deferModifications = true;
-        var executionRef = new AtomicReference<Task<String>>();
+        var executionRef = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -74,7 +74,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
-        var executionRef = new AtomicReference<Task<String>>();
+        var executionRef = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -97,21 +97,20 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
         queue.completeRenewals = false;
-        var executionRef = new AtomicReference<Task<String>>();
-        var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
+        var executionRef = new AtomicReference<TaskHandle<String>>();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
         runtime.start();
         deterministicTaskQueue.runAllRunnableTasks();
-        var leaseLost = new AtomicBoolean();
-        executionRef.get().addLeaseLostListener(() -> leaseLost.set(true));
 
         deterministicTaskQueue.advanceTime(); // Renewal starts halfway through the lease and does not complete.
         deterministicTaskQueue.runAllRunnableTasks();
-        assertFalse(leaseLost.get());
+        assertNull(cancelledTask.get());
 
         deterministicTaskQueue.advanceTime(); // The expiry watchdog fires at the last confirmed expiry.
         deterministicTaskQueue.runAllRunnableTasks();
-        assertTrue(leaseLost.get());
+        assertSame(executionRef.get(), cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
         runtime.stop();
@@ -124,22 +123,21 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         queue.add("task", "initial");
         queue.deferModifications = true;
         queue.failRenewalsWithLeaseLoss = true;
-        var executionRef = new AtomicReference<Task<String>>();
-        var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
+        var executionRef = new AtomicReference<TaskHandle<String>>();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
         runtime.start();
         deterministicTaskQueue.runAllRunnableTasks();
         var execution = executionRef.get();
         var stateChangeFailure = new AtomicReference<Exception>();
-        var leaseLost = new AtomicBoolean();
-        execution.addLeaseLostListener(() -> leaseLost.set(true));
         execution.modify("modified", ActionListener.wrap(ignored -> fail("state change unexpectedly succeeded"), stateChangeFailure::set));
 
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
 
         assertThat(stateChangeFailure.get(), instanceOf(LeaseLostException.class));
-        assertTrue(leaseLost.get());
+        assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
         runtime.stop();
@@ -152,24 +150,23 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         queue.add("task", "initial");
         queue.deferFinishes = true;
         queue.failRenewalsWithLeaseLoss = true;
-        var executionRef = new AtomicReference<Task<String>>();
-        var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
+        var executionRef = new AtomicReference<TaskHandle<String>>();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
         runtime.start();
         deterministicTaskQueue.runAllRunnableTasks();
         var execution = executionRef.get();
         var finishFailure = new AtomicReference<Exception>();
-        var leaseLost = new AtomicBoolean();
-        execution.addLeaseLostListener(() -> leaseLost.set(true));
         execution.finish("finished", ActionListener.wrap(ignored -> fail("finish unexpectedly succeeded"), finishFailure::set));
 
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
-        assertFalse(leaseLost.get());
+        assertNull(cancelledTask.get());
 
         queue.failFinish();
         assertThat(finishFailure.get(), instanceOf(LeaseLostException.class));
-        assertTrue(leaseLost.get());
+        assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
         runtime.stop();
@@ -180,17 +177,15 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
-        var executionRef = new AtomicReference<Task<String>>();
-        var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
+        var executionRef = new AtomicReference<TaskHandle<String>>();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
         runtime.start();
         deterministicTaskQueue.runAllRunnableTasks();
-        var leaseLost = new AtomicBoolean();
-        executionRef.get().addLeaseLostListener(() -> leaseLost.set(true));
-
         runtime.stop();
 
-        assertTrue(leaseLost.get());
+        assertSame(executionRef.get(), cancelledTask.get());
         assertThat(queue.releasedLeases.size(), equalTo(1));
         assertThat(runtime.activeTaskCount(), equalTo(0));
         runtime.close();
@@ -217,7 +212,15 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
     private static TaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
-        Consumer<Task<String>> processor
+        Consumer<TaskHandle<String>> processor
+    ) {
+        return newRuntime(deterministicTaskQueue, queue, processor(processor, ignored -> {}));
+    }
+
+    private static TaskProcessorRuntime<String> newRuntime(
+        DeterministicTaskQueue deterministicTaskQueue,
+        TestTaskQueue queue,
+        Task<String> processor
     ) {
         var threadPool = deterministicTaskQueue.getThreadPool();
         return new TaskProcessorRuntime<>(
@@ -230,6 +233,20 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             TimeValue.timeValueMillis(100),
             TimeValue.timeValueSeconds(1)
         );
+    }
+
+    private static Task<String> processor(Consumer<TaskHandle<String>> process, Consumer<TaskHandle<String>> cancel) {
+        return new Task<>() {
+            @Override
+            public void process(TaskHandle<String> task) {
+                process.accept(task);
+            }
+
+            @Override
+            public void cancel(TaskHandle<String> task) {
+                cancel.accept(task);
+            }
+        };
     }
 
     private static class TestTaskQueue implements TaskQueue<String> {
