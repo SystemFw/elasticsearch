@@ -54,6 +54,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
     private record LocalState<T>(T state, boolean closed, boolean terminalUpdate, ActionListener<T> updateListener) {}
 
+    private record LeaseState(Lease lease, long renewAtMillis, boolean renewalInProgress) {}
+
     /** Creates a runtime for one task type and processor. */
     public TaskProcessorRuntime(
         TaskQueue<S> queue,
@@ -249,7 +251,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             ? ActionListener.wrap(listener::onResponse, e -> listener.onFailure(terminalUpdateFailure(task, e)))
             : listener;
         try {
-            queue.update(task.lease, newState, terminal, updateListener);
+            queue.update(task.leaseState.lease(), newState, terminal, updateListener);
         } catch (Exception e) {
             updateListener.onFailure(e);
         }
@@ -275,9 +277,10 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
             long checkAtMillis = Long.MAX_VALUE;
             for (ActiveTask task : active.values()) {
-                final long taskCheckAt = task.renewalInProgress
-                    ? task.lease.expiryMillis()
-                    : Math.min(task.renewAtMillis, task.lease.expiryMillis());
+                final LeaseState leaseState = task.leaseState;
+                final long taskCheckAt = leaseState.renewalInProgress()
+                    ? leaseState.lease().expiryMillis()
+                    : Math.min(leaseState.renewAtMillis(), leaseState.lease().expiryMillis());
                 checkAtMillis = Math.min(checkAtMillis, taskCheckAt);
             }
             if (nextLeaseCheck != null && nextLeaseCheckAtMillis <= checkAtMillis) {
@@ -323,16 +326,19 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
             final long nowMillis = threadPool.absoluteTimeInMillis();
             for (ActiveTask task : active.values()) {
-                if (nowMillis >= task.lease.expiryMillis()) {
+                final LeaseState leaseState = task.leaseState;
+                if (nowMillis >= leaseState.lease().expiryMillis()) {
                     expired.add(task);
-                } else if (task.renewalInProgress == false && nowMillis >= task.renewAtMillis) {
-                    task.renewalInProgress = true;
+                } else if (leaseState.renewalInProgress() == false && nowMillis >= leaseState.renewAtMillis()) {
+                    task.leaseState = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), true);
                     toRenew.add(task);
                 }
             }
         }
 
-        expired.forEach(task -> task.leaseLost(new LeaseLostException("lease for task [" + task.lease.taskId() + "] has expired")));
+        expired.forEach(
+            task -> task.leaseLost(new LeaseLostException("lease for task [" + task.leaseState.lease().taskId() + "] has expired"))
+        );
         toRenew.forEach(this::renew);
         scheduleNextLeaseCheck();
     }
@@ -343,7 +349,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             if (running == false || active.get(task.taskId()) != task) {
                 return;
             }
-            lease = task.lease;
+            lease = task.leaseState.lease();
         }
         final ActionListener<Lease> listener = ActionListener.assertOnce(
             ActionListener.wrap(renewedLease -> leaseRenewed(task, lease, renewedLease), e -> leaseRenewalFailed(task, e))
@@ -361,16 +367,16 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             if (running == false || active.get(task.taskId()) != task) {
                 return;
             }
-            task.renewalInProgress = false;
+            final LeaseState leaseState = task.leaseState;
             final long nowMillis = threadPool.absoluteTimeInMillis();
-            if (task.lease != previousLease
+            if (leaseState.lease() != previousLease
                 || renewedLease == null
                 || sameLeaseIncarnation(previousLease, renewedLease) == false
                 || renewedLease.expiryMillis() <= nowMillis) {
+                task.leaseState = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), false);
                 invalidLease = new LeaseLostException("queue returned an invalid renewed lease for task [" + task.taskId() + "]");
             } else {
-                task.lease = renewedLease;
-                task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
+                task.leaseState = new LeaseState(renewedLease, renewalTime(nowMillis, renewedLease.expiryMillis()), false);
             }
         }
 
@@ -387,22 +393,24 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             if (running == false || active.get(task.taskId()) != task) {
                 return;
             }
-            task.renewalInProgress = false;
+            final LeaseState leaseState = task.leaseState;
             final long nowMillis = threadPool.absoluteTimeInMillis();
             if (failure instanceof LeaseLostException) {
                 loseLease = task.localState.get().terminalUpdate() == false;
-                task.renewAtMillis = task.lease.expiryMillis();
+                task.leaseState = new LeaseState(leaseState.lease(), leaseState.lease().expiryMillis(), false);
                 if (loseLease == false) {
                     task.deferredLeaseLoss = failure;
                 }
-            } else if (nowMillis >= task.lease.expiryMillis()) {
+            } else if (nowMillis >= leaseState.lease().expiryMillis()) {
                 loseLease = true;
+                task.leaseState = new LeaseState(leaseState.lease(), leaseState.renewAtMillis(), false);
                 failure = new LeaseLostException("lease for task [" + task.taskId() + "] has expired", failure);
             } else {
                 loseLease = false;
                 final long normalRetryMillis = Math.max(1L, leaseDuration.millis() / 10L);
-                final long remainingMillis = task.lease.expiryMillis() - nowMillis;
-                task.renewAtMillis = nowMillis + Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
+                final long remainingMillis = leaseState.lease().expiryMillis() - nowMillis;
+                final long renewAtMillis = nowMillis + Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
+                task.leaseState = new LeaseState(leaseState.lease(), renewAtMillis, false);
             }
         }
 
@@ -443,7 +451,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             )
         );
         try {
-            queue.release(task.lease, listener);
+            queue.release(task.leaseState.lease(), listener);
         } catch (Exception e) {
             listener.onFailure(e);
         }
@@ -485,20 +493,17 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         private final String taskId;
 
-        // Updated while holding TaskProcessorRuntime.this and read by queue operations after an authority check.
-        private volatile Lease lease;
+        // Replaced while holding TaskProcessorRuntime.this and read by queue operations after an authority check.
+        private volatile LeaseState leaseState;
 
-        // The following fields are guarded by TaskProcessorRuntime.this.
-        private long renewAtMillis;
-        private boolean renewalInProgress;
+        // Guarded by TaskProcessorRuntime.this.
         private Exception deferredLeaseLoss;
 
         private final AtomicReference<LocalState<S>> localState;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
             this.taskId = lease.taskId();
-            this.lease = lease;
-            this.renewAtMillis = renewAtMillis;
+            this.leaseState = new LeaseState(lease, renewAtMillis, false);
             this.localState = new AtomicReference<>(new LocalState<>(state, false, false, null));
         }
 
