@@ -17,6 +17,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeasedTask;
+import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Task;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -24,16 +25,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
+import java.util.function.Consumer;
 
 /**
- * Runs a {@link TaskProcessor} against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management.
+ * Runs a processor against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management.
  */
-public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent implements TaskExecutionImpl.Operations<S> {
+public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent implements TaskImpl.Operations<S> {
 
     private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
 
     private final TaskQueue<S> queue;
-    private final TaskProcessor<S> processor;
+    private final Consumer<Task<S>> processor;
     private final ThreadPool threadPool;
     private final Executor processorExecutor;
     private final String workerId;
@@ -53,7 +55,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
     /** Creates a runtime for one task type and processor. */
     public TaskProcessorRuntime(
         TaskQueue<S> queue,
-        TaskProcessor<S> processor,
+        Consumer<Task<S>> processor,
         ThreadPool threadPool,
         Executor processorExecutor,
         String workerId,
@@ -134,7 +136,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
 
     private void claimsCompleted(List<LeasedTask<S>> claimedTasks) {
         Objects.requireNonNull(claimedTasks);
-        final List<TaskExecutionImpl<S>> toStart = new ArrayList<>();
+        final List<TaskImpl<S>> toStart = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
         final boolean shouldPollLater;
 
@@ -149,7 +151,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
                     if (remainingCapacity > 0
                         && active.containsKey(task.lease().taskId()) == false
                         && task.lease().expiryMillis() > nowMillis) {
-                        var execution = new TaskExecutionImpl<>(task.lease().taskId(), task.state(), this, this::executionEnded);
+                        var execution = new TaskImpl<>(task.lease().taskId(), task.state(), this, this::executionEnded);
                         var activeTask = new ActiveTask<>(execution, task.lease(), renewalTime(nowMillis, task.lease().expiryMillis()));
                         active.put(task.lease().taskId(), activeTask);
                         toStart.add(execution);
@@ -209,7 +211,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    private void startExecution(TaskExecutionImpl<S> execution) {
+    private void startExecution(TaskImpl<S> execution) {
         if (execution.canProcess() == false) {
             return;
         }
@@ -219,7 +221,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
                     return;
                 }
                 try {
-                    processor.process(execution);
+                    processor.accept(execution);
                 } catch (Exception e) {
                     execution.processorFailed(e);
                 }
@@ -230,7 +232,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
     }
 
     @Override
-    public void modify(TaskExecutionImpl<S> execution, S newState, ActionListener<S> listener) {
+    public void modify(TaskImpl<S> execution, S newState, ActionListener<S> listener) {
         final ActiveTask<S> task = currentTask(execution);
         if (task == null) {
             listener.onFailure(new LeaseLostException("lease for task [" + execution.taskId() + "] is no longer active"));
@@ -244,7 +246,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
     }
 
     @Override
-    public void finish(TaskExecutionImpl<S> execution, S finalState, ActionListener<S> listener) {
+    public void finish(TaskImpl<S> execution, S finalState, ActionListener<S> listener) {
         final ActiveTask<S> task = currentTask(execution);
         if (task == null) {
             listener.onFailure(new LeaseLostException("lease for task [" + execution.taskId() + "] is no longer active"));
@@ -258,7 +260,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    private synchronized ActiveTask<S> currentTask(TaskExecutionImpl<S> execution) {
+    private synchronized ActiveTask<S> currentTask(TaskImpl<S> execution) {
         final ActiveTask<S> task = active.get(execution.taskId());
         return task != null && task.execution == execution ? task : null;
     }
@@ -448,7 +450,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
         }
     }
 
-    private void executionEnded(TaskExecutionImpl<S> execution) {
+    private void executionEnded(TaskImpl<S> execution) {
         final boolean refill;
         synchronized (this) {
             final ActiveTask<S> task = active.get(execution.taskId());
@@ -481,13 +483,13 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent im
     }
 
     private static final class ActiveTask<S> {
-        private final TaskExecutionImpl<S> execution;
+        private final TaskImpl<S> execution;
         private volatile Lease lease;
         private long renewAtMillis;
         private boolean renewalInProgress;
         private Exception deferredLeaseLoss;
 
-        private ActiveTask(TaskExecutionImpl<S> execution, Lease lease, long renewAtMillis) {
+        private ActiveTask(TaskImpl<S> execution, Lease lease, long renewAtMillis) {
             this.execution = execution;
             this.lease = lease;
             this.renewAtMillis = renewAtMillis;

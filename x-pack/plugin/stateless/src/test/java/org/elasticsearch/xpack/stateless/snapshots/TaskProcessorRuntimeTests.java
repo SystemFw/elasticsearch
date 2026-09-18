@@ -11,10 +11,10 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.test.ESTestCase;
-import org.elasticsearch.xpack.stateless.snapshots.TaskProcessor.TaskExecution;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeasedTask;
+import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Task;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
@@ -34,7 +35,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
         queue.deferModifications = true;
-        var executionRef = new AtomicReference<TaskExecution<String>>();
+        var executionRef = new AtomicReference<Task<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -73,7 +74,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
-        var executionRef = new AtomicReference<TaskExecution<String>>();
+        var executionRef = new AtomicReference<Task<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -96,7 +97,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
         queue.completeRenewals = false;
-        var executionRef = new AtomicReference<TaskExecution<String>>();
+        var executionRef = new AtomicReference<Task<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -123,7 +124,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         queue.add("task", "initial");
         queue.deferModifications = true;
         queue.failRenewalsWithLeaseLoss = true;
-        var executionRef = new AtomicReference<TaskExecution<String>>();
+        var executionRef = new AtomicReference<Task<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -151,7 +152,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         queue.add("task", "initial");
         queue.deferFinishes = true;
         queue.failRenewalsWithLeaseLoss = true;
-        var executionRef = new AtomicReference<TaskExecution<String>>();
+        var executionRef = new AtomicReference<Task<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -179,7 +180,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
-        var executionRef = new AtomicReference<TaskExecution<String>>();
+        var executionRef = new AtomicReference<Task<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
         runtime.start();
@@ -216,7 +217,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
     private static TaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
-        TaskProcessor<String> processor
+        Consumer<Task<String>> processor
     ) {
         var threadPool = deterministicTaskQueue.getThreadPool();
         return new TaskProcessorRuntime<>(

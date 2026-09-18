@@ -21,6 +21,25 @@ import java.util.Objects;
 public interface TaskQueue<S> {
 
     /**
+     * Processor-facing access to one leased task. A processor may have internal concurrency, but must submit persistent state changes
+     * sequentially: only one call to {@link #modify} or {@link #finish} may be outstanding.
+     */
+    interface Task<S> {
+
+        /** Returns the state from the latest successful persistent state change. */
+        S state();
+
+        /** Persists a non-terminal state change. */
+        void modify(S newState, ActionListener<S> listener);
+
+        /** Persists the final state and completes this task. */
+        void finish(S finalState, ActionListener<S> listener);
+
+        /** Registers a callback that runs if this task loses authority before finishing. */
+        void addLeaseLostListener(Runnable listener);
+    }
+
+    /**
      * Identifies one ownership incarnation of a queued task.
      *
      * @param taskId the durable task identifier

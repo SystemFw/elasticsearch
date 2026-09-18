@@ -10,8 +10,8 @@ package org.elasticsearch.xpack.stateless.snapshots;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
-import org.elasticsearch.xpack.stateless.snapshots.TaskProcessor.TaskExecution;
 import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.LeaseLostException;
+import org.elasticsearch.xpack.stateless.snapshots.TaskQueue.Task;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -19,14 +19,14 @@ import java.util.Objects;
 import java.util.function.Consumer;
 
 /** Implements the processor-facing state machine for one lease incarnation. */
-final class TaskExecutionImpl<S> implements TaskExecution<S> {
+final class TaskImpl<S> implements Task<S> {
 
-    private static final Logger logger = LogManager.getLogger(TaskExecutionImpl.class);
+    private static final Logger logger = LogManager.getLogger(TaskImpl.class);
 
     interface Operations<S> {
-        void modify(TaskExecutionImpl<S> execution, S newState, ActionListener<S> listener);
+        void modify(TaskImpl<S> task, S newState, ActionListener<S> listener);
 
-        void finish(TaskExecutionImpl<S> execution, S finalState, ActionListener<S> listener);
+        void finish(TaskImpl<S> task, S finalState, ActionListener<S> listener);
     }
 
     private enum Status {
@@ -41,7 +41,7 @@ final class TaskExecutionImpl<S> implements TaskExecution<S> {
 
     private final String taskId;
     private final Operations<S> operations;
-    private final Consumer<TaskExecutionImpl<S>> onEnded;
+    private final Consumer<TaskImpl<S>> onEnded;
     private final List<Runnable> leaseLostListeners = new ArrayList<>();
 
     // The following fields are guarded by this.
@@ -49,7 +49,7 @@ final class TaskExecutionImpl<S> implements TaskExecution<S> {
     private Status status = Status.ACTIVE;
     private ActionListener<S> pendingStateListener;
 
-    TaskExecutionImpl(String taskId, S state, Operations<S> operations, Consumer<TaskExecutionImpl<S>> onEnded) {
+    TaskImpl(String taskId, S state, Operations<S> operations, Consumer<TaskImpl<S>> onEnded) {
         this.taskId = Objects.requireNonNull(taskId);
         this.state = Objects.requireNonNull(state);
         this.operations = Objects.requireNonNull(operations);
