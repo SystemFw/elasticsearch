@@ -236,30 +236,19 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
     }
 
-    private void modify(ActiveTask handle, S newState, ActionListener<S> listener) {
+    private void update(ActiveTask handle, S newState, boolean terminal, ActionListener<S> listener) {
         final ActiveTask task = currentTask(handle);
         if (task == null) {
             listener.onFailure(new LeaseLostException("lease for task [" + handle.taskId() + "] is no longer active"));
             return;
         }
+        final ActionListener<S> updateListener = terminal
+            ? ActionListener.wrap(listener::onResponse, e -> listener.onFailure(terminalUpdateFailure(task, e)))
+            : listener;
         try {
-            queue.modify(task.lease, newState, listener);
+            queue.update(task.lease, newState, terminal, updateListener);
         } catch (Exception e) {
-            listener.onFailure(e);
-        }
-    }
-
-    private void finish(ActiveTask handle, S finalState, ActionListener<S> listener) {
-        final ActiveTask task = currentTask(handle);
-        if (task == null) {
-            listener.onFailure(new LeaseLostException("lease for task [" + handle.taskId() + "] is no longer active"));
-            return;
-        }
-        final ActionListener<S> finishListener = ActionListener.wrap(listener::onResponse, e -> listener.onFailure(finishFailure(task, e)));
-        try {
-            queue.finish(task.lease, finalState, finishListener);
-        } catch (Exception e) {
-            finishListener.onFailure(e);
+            updateListener.onFailure(e);
         }
     }
 
@@ -268,7 +257,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         return task == handle ? task : null;
     }
 
-    private synchronized Exception finishFailure(ActiveTask task, Exception failure) {
+    private synchronized Exception terminalUpdateFailure(ActiveTask task, Exception failure) {
         return task.deferredLeaseLoss == null ? failure : task.deferredLeaseLoss;
     }
 
@@ -398,7 +387,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             task.renewalInProgress = false;
             final long nowMillis = threadPool.absoluteTimeInMillis();
             if (failure instanceof LeaseLostException) {
-                loseLease = task.isFinishing() == false;
+                loseLease = task.hasTerminalUpdateInProgress() == false;
                 task.renewAtMillis = task.lease.expiryMillis();
                 if (loseLease == false) {
                     task.deferredLeaseLoss = failure;
@@ -485,11 +474,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     /** Holds the runtime and processor-facing state for one lease incarnation. */
     private final class ActiveTask implements TaskHandle<S> {
 
-        private enum ChangeType {
-            MODIFY,
-            FINISH
-        }
-
         private final String taskId;
 
         // Updated while holding TaskProcessorRuntime.this and read by queue operations after an authority check.
@@ -520,8 +504,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             return closed == false;
         }
 
-        private synchronized boolean isFinishing() {
-            return pendingChange != null && pendingChange.type == ChangeType.FINISH;
+        private synchronized boolean hasTerminalUpdateInProgress() {
+            return pendingChange != null && pendingChange.terminal;
         }
 
         @Override
@@ -530,16 +514,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
 
         @Override
-        public void modify(S newState, ActionListener<S> listener) {
-            changeState(newState, ChangeType.MODIFY, listener);
-        }
-
-        @Override
-        public void finish(S finalState, ActionListener<S> listener) {
-            changeState(finalState, ChangeType.FINISH, listener);
-        }
-
-        private void changeState(S newState, ChangeType type, ActionListener<S> listener) {
+        public void update(S newState, boolean terminal, ActionListener<S> listener) {
             Objects.requireNonNull(newState);
             Objects.requireNonNull(listener);
 
@@ -553,7 +528,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                     change = null;
                     rejection = new IllegalStateException("task [" + taskId + "] already has a persistent state change in progress");
                 } else {
-                    change = new PendingChange(type, listener);
+                    change = new PendingChange(terminal, listener);
                     pendingChange = change;
                     rejection = null;
                 }
@@ -567,11 +542,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             final ActionListener<S> operationListener = ActionListener.assertOnce(
                 ActionListener.wrap(persistedState -> stateChangeCompleted(change, persistedState), e -> stateChangeFailed(change, e))
             );
-            if (type == ChangeType.MODIFY) {
-                TaskProcessorRuntime.this.modify(this, newState, operationListener);
-            } else {
-                TaskProcessorRuntime.this.finish(this, newState, operationListener);
-            }
+            TaskProcessorRuntime.this.update(this, newState, terminal, operationListener);
         }
 
         private void stateChangeCompleted(PendingChange change, S persistedState) {
@@ -583,7 +554,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
                 state = Objects.requireNonNull(persistedState);
                 pendingChange = null;
-                finished = change.type == ChangeType.FINISH;
+                finished = change.terminal;
                 closed = finished;
             }
 
@@ -666,11 +637,11 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
 
         private final class PendingChange {
-            private final ChangeType type;
+            private final boolean terminal;
             private final ActionListener<S> listener;
 
-            private PendingChange(ChangeType type, ActionListener<S> listener) {
-                this.type = type;
+            private PendingChange(boolean terminal, ActionListener<S> listener) {
+                this.terminal = terminal;
                 this.listener = listener;
             }
         }

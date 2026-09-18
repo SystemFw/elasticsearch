@@ -53,11 +53,8 @@ public interface TaskQueue<S> {
     /** Renews a live lease and returns its new expiry. */
     void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener);
 
-    /** Replaces the task-specific persistent state while retaining the lease. */
-    void modify(Lease lease, S newState, ActionListener<S> listener);
-
-    /** Replaces the task-specific persistent state, makes the task terminal, and removes its lease. */
-    void finish(Lease lease, S finalState, ActionListener<S> listener);
+    /** Replaces the task-specific persistent state, optionally making the task terminal and removing its lease. */
+    void update(Lease lease, S newState, boolean terminal, ActionListener<S> listener);
 
     /**
      * Voluntarily gives up the lease and makes the task available immediately. This operation must be idempotent for a task that remains

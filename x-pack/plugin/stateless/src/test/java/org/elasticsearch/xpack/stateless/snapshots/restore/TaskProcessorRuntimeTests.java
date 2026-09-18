@@ -47,11 +47,12 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         assertThat(runtime.activeTaskCount(), equalTo(1));
 
         var firstResult = new AtomicReference<String>();
-        execution.modify("modified", ActionListener.wrap(firstResult::set, e -> fail(e.getMessage())));
+        execution.update("modified", false, ActionListener.wrap(firstResult::set, e -> fail(e.getMessage())));
 
         var concurrentFailure = new AtomicReference<Exception>();
-        execution.modify(
+        execution.update(
             "not-written",
+            false,
             ActionListener.wrap(ignored -> fail("second modification unexpectedly succeeded"), concurrentFailure::set)
         );
         assertThat(concurrentFailure.get(), instanceOf(IllegalStateException.class));
@@ -62,7 +63,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         assertThat(execution.state(), equalTo("modified"));
 
         var finalResult = new AtomicReference<String>();
-        execution.finish("finished", ActionListener.wrap(finalResult::set, e -> fail(e.getMessage())));
+        execution.update("finished", true, ActionListener.wrap(finalResult::set, e -> fail(e.getMessage())));
         assertThat(finalResult.get(), equalTo("finished"));
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
@@ -131,7 +132,11 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         deterministicTaskQueue.runAllRunnableTasks();
         var execution = executionRef.get();
         var stateChangeFailure = new AtomicReference<Exception>();
-        execution.modify("modified", ActionListener.wrap(ignored -> fail("state change unexpectedly succeeded"), stateChangeFailure::set));
+        execution.update(
+            "modified",
+            false,
+            ActionListener.wrap(ignored -> fail("state change unexpectedly succeeded"), stateChangeFailure::set)
+        );
 
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
@@ -158,7 +163,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         deterministicTaskQueue.runAllRunnableTasks();
         var execution = executionRef.get();
         var finishFailure = new AtomicReference<Exception>();
-        execution.finish("finished", ActionListener.wrap(ignored -> fail("finish unexpectedly succeeded"), finishFailure::set));
+        execution.update("finished", true, ActionListener.wrap(ignored -> fail("finish unexpectedly succeeded"), finishFailure::set));
 
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
@@ -324,8 +329,16 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void modify(Lease lease, String newState, ActionListener<String> listener) {
-            if (deferModifications) {
+        public void update(Lease lease, String newState, boolean terminal, ActionListener<String> listener) {
+            if (terminal) {
+                if (deferFinishes) {
+                    assertNull(pendingFinish);
+                    pendingFinish = listener;
+                } else {
+                    states.put(lease.taskId(), newState);
+                    listener.onResponse(newState);
+                }
+            } else if (deferModifications) {
                 assertNull(pendingModification);
                 pendingModification = new PendingModification(lease.taskId(), newState, listener);
             } else {
@@ -339,17 +352,6 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             pendingModification = null;
             states.put(modification.taskId, modification.state);
             modification.listener.onResponse(modification.state);
-        }
-
-        @Override
-        public void finish(Lease lease, String finalState, ActionListener<String> listener) {
-            if (deferFinishes) {
-                assertNull(pendingFinish);
-                pendingFinish = listener;
-            } else {
-                states.put(lease.taskId(), finalState);
-                listener.onResponse(finalState);
-            }
         }
 
         void failFinish() {

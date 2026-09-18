@@ -19,18 +19,14 @@ public interface Task<S> {
     void cancel(TaskHandle<S> task);
 
     /**
-     * Access to one leased task. A task may have internal concurrency, but must submit persistent state changes sequentially: only one
-     * call to {@link #modify} or {@link #finish} may be outstanding.
+     * Access to one leased task. A task may have internal concurrency, but only one call to {@link #update} may be outstanding.
      */
     interface TaskHandle<S> {
 
         /** Returns the state from the latest successful persistent state change. */
         S state();
 
-        /** Persists a non-terminal state change. */
-        void modify(S newState, ActionListener<S> listener);
-
-        /** Persists the final state and completes this task. */
-        void finish(S finalState, ActionListener<S> listener);
+        /** Persists a state change, making the task terminal when {@code terminal} is {@code true}. */
+        void update(S newState, boolean terminal, ActionListener<S> listener);
     }
 }
