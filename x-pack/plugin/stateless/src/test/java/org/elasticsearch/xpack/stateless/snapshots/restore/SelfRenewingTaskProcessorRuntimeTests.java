@@ -29,7 +29,7 @@ import java.util.function.Consumer;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
 
-public class TaskProcessorRuntimeTests extends ESTestCase {
+public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
 
     public void testProcessorModifiesStateSequentiallyAndFinishes() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
@@ -87,8 +87,8 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         deterministicTaskQueue.runAllRunnableTasks();
 
         assertThat(queue.renewedLeases.size(), equalTo(1));
-        assertThat(queue.singleRenewCount, equalTo(0));
-        assertThat(queue.bulkRenewCount, equalTo(1));
+        assertThat(queue.singleRenewCount, equalTo(1));
+        assertThat(queue.bulkRenewCount, equalTo(0));
         assertThat(runtime.activeTaskCount(), equalTo(1));
 
         runtime.stop();
@@ -96,7 +96,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
-    public void testDueLeasesAreRenewedInOneBatch() {
+    public void testDueLeasesAreRenewedIndependently() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task-1", "initial");
@@ -110,32 +110,8 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         deterministicTaskQueue.runAllRunnableTasks();
 
         assertThat(queue.renewedLeases.size(), equalTo(2));
-        assertThat(queue.singleRenewCount, equalTo(0));
-        assertThat(queue.bulkRenewCount, equalTo(1));
-
-        runtime.stop();
-        runtime.close();
-    }
-
-    public void testBulkRenewalResultsAreAppliedIndependently() {
-        var deterministicTaskQueue = new DeterministicTaskQueue();
-        var queue = new TestTaskQueue(deterministicTaskQueue);
-        queue.add("task-1", "lost");
-        queue.add("task-2", "renewed");
-        queue.leaseLostOnRenewalTaskId = "task-1";
-        var cancelledStates = new ArrayList<String>();
-        var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> {}, task -> cancelledStates.add(task.state())), 2);
-
-        runtime.start();
-        deterministicTaskQueue.runAllRunnableTasks();
-
-        deterministicTaskQueue.advanceTime();
-        deterministicTaskQueue.runAllRunnableTasks();
-
-        assertThat(queue.singleRenewCount, equalTo(0));
-        assertThat(queue.bulkRenewCount, equalTo(1));
-        assertThat(cancelledStates, equalTo(List.of("lost")));
-        assertThat(runtime.activeTaskCount(), equalTo(1));
+        assertThat(queue.singleRenewCount, equalTo(2));
+        assertThat(queue.bulkRenewCount, equalTo(0));
 
         runtime.stop();
         runtime.close();
@@ -277,7 +253,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
-    private static TaskProcessorRuntime<String> newRuntime(
+    private static SelfRenewingTaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
         Consumer<TaskHandle<String>> processor
@@ -285,7 +261,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         return newRuntime(deterministicTaskQueue, queue, processor(processor, ignored -> {}));
     }
 
-    private static TaskProcessorRuntime<String> newRuntime(
+    private static SelfRenewingTaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
         Task<String> processor
@@ -293,14 +269,14 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         return newRuntime(deterministicTaskQueue, queue, processor, 1);
     }
 
-    private static TaskProcessorRuntime<String> newRuntime(
+    private static SelfRenewingTaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
         Task<String> processor,
         int maxConcurrentTasks
     ) {
         var threadPool = deterministicTaskQueue.getThreadPool();
-        return new TaskProcessorRuntime<>(
+        return new SelfRenewingTaskProcessorRuntime<>(
             queue,
             processor,
             threadPool,
@@ -342,7 +318,6 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private boolean deferFinishes;
         private boolean completeRenewals = true;
         private boolean failRenewalsWithLeaseLoss;
-        private String leaseLostOnRenewalTaskId;
         private ActionListener<List<Tuple<String, Lease>>> pendingClaim;
         private PendingModification pendingModification;
         private PendingModification pendingFinish;
@@ -410,20 +385,22 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<RenewalResult>> listener) {
             bulkRenewCount++;
             renewedLeases.addAll(leases);
-            if (completeRenewals) {
+            if (failRenewalsWithLeaseLoss) {
+                listener.onResponse(
+                    leases.stream().map(ignored -> RenewalResult.failure(new LeaseLostException("simulated fencing"))).toList()
+                );
+            } else if (completeRenewals) {
                 listener.onResponse(
                     leases.stream()
                         .map(
-                            lease -> failRenewalsWithLeaseLoss || lease.taskId().equals(leaseLostOnRenewalTaskId)
-                                ? RenewalResult.failure(new LeaseLostException("simulated fencing"))
-                                : RenewalResult.success(
-                                    new Lease(
-                                        lease.taskId(),
-                                        lease.ownerId(),
-                                        lease.fencingToken(),
-                                        deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
-                                    )
+                            lease -> RenewalResult.success(
+                                new Lease(
+                                    lease.taskId(),
+                                    lease.ownerId(),
+                                    lease.fencingToken(),
+                                    deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
                                 )
+                            )
                         )
                         .toList()
                 );

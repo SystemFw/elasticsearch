@@ -17,6 +17,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.RenewalResult;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -247,8 +248,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             cancellation.v1().leaseLost(cancellation.v2());
         }
         toRelease.forEach(this::release);
-        for (Tuple<ActiveTask, Lease> renewal : toRenew) {
-            renewal.v1().renew(renewal.v2());
+        if (toRenew.isEmpty() == false) {
+            renew(toRenew);
         }
         if (claimCapacity > 0) {
             claim(claimCapacity);
@@ -277,6 +278,39 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private void claimFailed(Exception failure) {
         logger.debug("failed to claim queued tasks", failure);
         reconcile(List.of(), null);
+    }
+
+    private void renew(List<Tuple<ActiveTask, Lease>> renewals) {
+        final List<Lease> leases = renewals.stream().map(Tuple::v2).toList();
+        final ActionListener<List<RenewalResult>> listener = ActionListener.assertOnce(
+            ActionListener.wrap(results -> renewalsCompleted(renewals, results), failure -> renewalsFailed(renewals, failure))
+        );
+        try {
+            queue.renew(leases, leaseDuration, listener);
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    private void renewalsCompleted(List<Tuple<ActiveTask, Lease>> renewals, List<RenewalResult> results) {
+        if (results == null || results.size() != renewals.size() || results.stream().anyMatch(Objects::isNull)) {
+            renewalsFailed(renewals, new IllegalStateException("queue returned an invalid bulk renewal response"));
+            return;
+        }
+
+        for (int i = 0; i < renewals.size(); i++) {
+            final Tuple<ActiveTask, Lease> renewal = renewals.get(i);
+            final RenewalResult result = results.get(i);
+            renewal.v1().renewalCompleted(renewal.v2(), new Tuple<>(result.renewedLease(), result.failure()));
+        }
+        reconcile(null, null);
+    }
+
+    private void renewalsFailed(List<Tuple<ActiveTask, Lease>> renewals, Exception failure) {
+        for (Tuple<ActiveTask, Lease> renewal : renewals) {
+            renewal.v1().renewalCompleted(renewal.v2(), new Tuple<>(null, failure));
+        }
+        reconcile(null, null);
     }
 
     private void startExecution(ActiveTask task) {
@@ -394,36 +428,12 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             return leaseState.compareAndSet(current, updated);
         }
 
-        private void renew(Lease lease) {
-            if (isClosed()) {
-                return;
-            }
-            final ActionListener<Lease> listener = ActionListener.assertOnce(
-                ActionListener.wrap(renewedLease -> leaseRenewed(lease, renewedLease), failure -> leaseRenewalFailed(lease, failure))
-            );
-            try {
-                queue.renew(lease, leaseDuration, listener);
-            } catch (Exception e) {
-                listener.onFailure(e);
-            }
-        }
-
-        private void leaseRenewed(Lease previousLease, Lease renewedLease) {
-            renewalCompleted(previousLease, new Tuple<>(renewedLease, null));
-        }
-
-        private void leaseRenewalFailed(Lease previousLease, Exception failure) {
-            renewalCompleted(previousLease, new Tuple<>(null, failure));
-        }
-
         private void renewalCompleted(Lease previousLease, Tuple<Lease, Exception> result) {
             final LeaseState current = leaseState.get();
             if (current.lease() != previousLease || current.renewalInProgress() == false || current.renewalResult() != null) {
                 return;
             }
-            if (leaseState.compareAndSet(current, new LeaseState(previousLease, current.renewAtMillis(), true, result))) {
-                reconcile(null, null);
-            }
+            leaseState.compareAndSet(current, new LeaseState(previousLease, current.renewAtMillis(), true, result));
         }
 
         @Override

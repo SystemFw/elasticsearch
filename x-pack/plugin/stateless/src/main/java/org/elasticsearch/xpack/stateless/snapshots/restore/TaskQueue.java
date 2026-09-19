@@ -33,6 +33,26 @@ public interface TaskQueue<S> {
      */
     record Lease(String taskId, String ownerId, long fencingToken, long expiryMillis) {}
 
+    /** The result of one lease renewal within a bulk request. */
+    record RenewalResult(Lease renewedLease, Exception failure) {
+
+        public RenewalResult {
+            if ((renewedLease == null) == (failure == null)) {
+                throw new IllegalArgumentException("a renewal result must contain exactly one of a renewed lease or a failure");
+            }
+        }
+
+        /** Creates a successful renewal result. */
+        public static RenewalResult success(Lease renewedLease) {
+            return new RenewalResult(renewedLease, null);
+        }
+
+        /** Creates a failed renewal result. */
+        public static RenewalResult failure(Exception failure) {
+            return new RenewalResult(null, failure);
+        }
+    }
+
     /** Indicates that an operation was rejected because its lease no longer owns the task. */
     class LeaseLostException extends RuntimeException {
 
@@ -52,6 +72,12 @@ public interface TaskQueue<S> {
 
     /** Renews a live lease and returns its new expiry. */
     void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener);
+
+    /**
+     * Renews live leases in bulk. The response must contain one result per input lease, in the same order. A request-level failure is
+     * reported to {@code listener}; failures affecting individual leases are returned as item results.
+     */
+    void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<RenewalResult>> listener);
 
     /** Replaces the task-specific persistent state, optionally making the task terminal and removing its lease. */
     void update(Lease lease, S newState, boolean terminal, ActionListener<S> listener);
