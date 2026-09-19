@@ -49,81 +49,6 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
     private volatile boolean running;
     private volatile Scheduler.Cancellable claimPoller;
 
-    private record TaskState<T>(
-        T state,
-        Lease lease,
-        boolean closed,
-        boolean renewalInProgress,
-        long updateGeneration,
-        boolean terminalUpdate,
-        ActionListener<T> updateListener,
-        Scheduler.Cancellable renewalTimer,
-        Scheduler.Cancellable expiryTimer
-    ) {
-
-        private TaskState<T> withTimers(Scheduler.Cancellable newRenewalTimer, Scheduler.Cancellable newExpiryTimer) {
-            return new TaskState<>(
-                state,
-                lease,
-                closed,
-                renewalInProgress,
-                updateGeneration,
-                terminalUpdate,
-                updateListener,
-                newRenewalTimer,
-                newExpiryTimer
-            );
-        }
-
-        private TaskState<T> renewalStarted() {
-            return new TaskState<>(state, lease, closed, true, updateGeneration, terminalUpdate, updateListener, null, expiryTimer);
-        }
-
-        private TaskState<T> renewed(Lease renewedLease) {
-            return new TaskState<>(state, renewedLease, closed, false, updateGeneration, terminalUpdate, updateListener, null, null);
-        }
-
-        private TaskState<T> renewalRetryPending() {
-            return new TaskState<>(state, lease, closed, false, updateGeneration, terminalUpdate, updateListener, null, expiryTimer);
-        }
-
-        private TaskState<T> updateStarted(boolean terminal, ActionListener<T> listener) {
-            return new TaskState<>(
-                state,
-                lease,
-                closed,
-                renewalInProgress,
-                updateGeneration + 1L,
-                terminal,
-                listener,
-                renewalTimer,
-                expiryTimer
-            );
-        }
-
-        private TaskState<T> updateCompleted(T persistedState) {
-            return new TaskState<>(
-                persistedState,
-                lease,
-                terminalUpdate,
-                terminalUpdate ? false : renewalInProgress,
-                updateGeneration,
-                false,
-                null,
-                terminalUpdate ? null : renewalTimer,
-                terminalUpdate ? null : expiryTimer
-            );
-        }
-
-        private TaskState<T> updateFailed() {
-            return new TaskState<>(state, lease, closed, renewalInProgress, updateGeneration, false, null, renewalTimer, expiryTimer);
-        }
-
-        private TaskState<T> close() {
-            return new TaskState<>(state, lease, true, false, updateGeneration, false, null, null, null);
-        }
-    }
-
     /** Creates a runtime for one task type and processor. */
     public SelfRenewingTaskProcessorRuntime(
         TaskQueue<S> queue,
@@ -282,6 +207,90 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
 
     private final class ActiveTask implements TaskHandle<S> {
 
+        private record TaskState<T>(
+            T state,
+            Lease lease,
+            boolean closed,
+            boolean renewalInProgress,
+            long updateGeneration,
+            boolean terminalUpdate,
+            ActionListener<T> updateListener,
+            Scheduler.Cancellable renewalTimer,
+            Scheduler.Cancellable expiryTimer
+        ) {
+
+            private TaskState<T> withTimers(Scheduler.Cancellable newRenewalTimer, Scheduler.Cancellable newExpiryTimer) {
+                return new TaskState<>(
+                    state,
+                    lease,
+                    closed,
+                    renewalInProgress,
+                    updateGeneration,
+                    terminalUpdate,
+                    updateListener,
+                    newRenewalTimer,
+                    newExpiryTimer
+                );
+            }
+
+            private TaskState<T> renewalStarted() {
+                return new TaskState<>(state, lease, closed, true, updateGeneration, terminalUpdate, updateListener, null, expiryTimer);
+            }
+
+            private TaskState<T> renewed(Lease renewedLease) {
+                return new TaskState<>(state, renewedLease, closed, false, updateGeneration, terminalUpdate, updateListener, null, null);
+            }
+
+            private TaskState<T> renewalRetryPending() {
+                return new TaskState<>(state, lease, closed, false, updateGeneration, terminalUpdate, updateListener, null, expiryTimer);
+            }
+
+            private TaskState<T> updateStarted(boolean terminal, ActionListener<T> listener) {
+                return new TaskState<>(
+                    state,
+                    lease,
+                    closed,
+                    renewalInProgress,
+                    updateGeneration + 1L,
+                    terminal,
+                    listener,
+                    renewalTimer,
+                    expiryTimer
+                );
+            }
+
+            private TaskState<T> updateCompleted(T persistedState) {
+                return new TaskState<>(
+                    persistedState,
+                    lease,
+                    terminalUpdate,
+                    terminalUpdate ? false : renewalInProgress,
+                    updateGeneration,
+                    false,
+                    null,
+                    terminalUpdate ? null : renewalTimer,
+                    terminalUpdate ? null : expiryTimer
+                );
+            }
+
+            private TaskState<T> updateFailed() {
+                return new TaskState<>(state, lease, closed, renewalInProgress, updateGeneration, false, null, renewalTimer, expiryTimer);
+            }
+
+            private TaskState<T> close() {
+                return new TaskState<>(state, lease, true, false, updateGeneration, false, null, null, null);
+            }
+
+            private void cancelTimers() {
+                if (renewalTimer != null) {
+                    renewalTimer.cancel();
+                }
+                if (expiryTimer != null) {
+                    expiryTimer.cancel();
+                }
+            }
+        }
+
         private final String taskId;
         private final AtomicReference<TaskState<S>> taskState;
 
@@ -325,8 +334,12 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 );
                 installTimers(lease, renewalTimer, expiryTimer);
             } catch (Exception e) {
-                cancelTimer(renewalTimer);
-                cancelTimer(expiryTimer);
+                if (renewalTimer != null) {
+                    renewalTimer.cancel();
+                }
+                if (expiryTimer != null) {
+                    expiryTimer.cancel();
+                }
                 closeAndCancel(
                     state -> state.lease() == lease,
                     new LeaseLostException("could not schedule lease management for task [" + taskId + "]", e)
@@ -402,8 +415,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             if (previous.closed() || previous.lease() != previousLease || previous.renewalInProgress() == false) {
                 return;
             }
-            cancelTimer(previous.renewalTimer());
-            cancelTimer(previous.expiryTimer());
+            previous.cancelTimers();
             scheduleLease(renewedLease);
         }
 
@@ -497,8 +509,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 return;
             }
             if (previous.terminalUpdate()) {
-                cancelTimer(previous.renewalTimer());
-                cancelTimer(previous.expiryTimer());
+                previous.cancelTimers();
                 activeTasks.remove(this);
             }
             previous.updateListener().onResponse(persistedState);
@@ -548,8 +559,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             }
 
             activeTasks.remove(this);
-            cancelTimer(previous.renewalTimer());
-            cancelTimer(previous.expiryTimer());
+            previous.cancelTimers();
             cancelTask(this);
             if (previous.updateListener() != null) {
                 try {
@@ -561,10 +571,5 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             return previous;
         }
 
-        private void cancelTimer(Scheduler.Cancellable timer) {
-            if (timer != null) {
-                timer.cancel();
-            }
-        }
     }
 }
