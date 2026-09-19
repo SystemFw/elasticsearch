@@ -42,8 +42,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
     private final Object mutex = new Object();
     private final List<ActiveTask> tasks = new ArrayList<>();
-    private final AtomicReference<List<Tuple<S, Lease>>> completedClaim = new AtomicReference<>();
-    private final AtomicReference<Exception> maintenanceFailure = new AtomicReference<>();
     private volatile boolean running;
     private boolean claimInProgress;
     private long nextClaimAtMillis;
@@ -89,13 +87,13 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     @Override
     protected void doStart() {
         running = true;
-        reconcile();
+        reconcile(null, null);
     }
 
     @Override
     protected void doStop() {
         running = false;
-        reconcile();
+        reconcile(null, null);
     }
 
     @Override
@@ -104,7 +102,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     /**
      * Reconciles all runtime-owned state under one short critical section. Queue, processor and scheduler calls are dispatched afterwards.
      */
-    private void reconcile() {
+    private void reconcile(List<Tuple<S, Lease>> claimedTasks, Exception schedulingFailure) {
         final List<Tuple<ActiveTask, Lease>> toRenew = new ArrayList<>();
         final List<Tuple<ActiveTask, Exception>> toCancel = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
@@ -118,8 +116,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 wakeAtMillis = Long.MAX_VALUE;
             }
 
-            final Exception schedulingFailure = maintenanceFailure.getAndSet(null);
-            final List<Tuple<S, Lease>> claimedTasks = completedClaim.getAndSet(null);
             if (claimedTasks != null) {
                 claimInProgress = false;
                 if (running && schedulingFailure == null) {
@@ -275,14 +271,12 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     }
 
     private void claimsCompleted(List<Tuple<S, Lease>> claimedTasks) {
-        completedClaim.set(claimedTasks);
-        reconcile();
+        reconcile(claimedTasks, null);
     }
 
     private void claimFailed(Exception failure) {
         logger.debug("failed to claim queued tasks", failure);
-        completedClaim.set(List.of());
-        reconcile();
+        reconcile(List.of(), null);
     }
 
     private void startExecution(ActiveTask task) {
@@ -308,10 +302,9 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private void scheduleWake(long atMillis) {
         final long delayMillis = Math.max(1L, atMillis - threadPool.absoluteTimeInMillis());
         try {
-            threadPool.schedule(this::reconcile, TimeValue.timeValueMillis(delayMillis), threadPool.generic());
+            threadPool.schedule(() -> reconcile(null, null), TimeValue.timeValueMillis(delayMillis), threadPool.generic());
         } catch (Exception e) {
-            maintenanceFailure.compareAndSet(null, e);
-            reconcile();
+            reconcile(null, e);
         }
     }
 
@@ -429,7 +422,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 return;
             }
             if (leaseState.compareAndSet(current, new LeaseState(previousLease, current.renewAtMillis(), true, result))) {
-                reconcile();
+                reconcile(null, null);
             }
         }
 
@@ -481,7 +474,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             }
 
             if (completed.closed()) {
-                reconcile();
+                reconcile(null, null);
             }
             pendingUpdate.updateListener().onResponse(persistedState);
         }
@@ -505,7 +498,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         private void leaseLost(Exception failure) {
             closeAndCancel(this, failure);
-            reconcile();
+            reconcile(null, null);
         }
 
         private LocalState<S> close() {
