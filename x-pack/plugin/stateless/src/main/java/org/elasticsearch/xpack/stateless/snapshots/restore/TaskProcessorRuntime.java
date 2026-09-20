@@ -418,12 +418,20 @@ public abstract class TaskProcessorRuntime<S> {
         }
 
         private void stateChangeFailed(Exception failure) {
-            cancel(failure);
+            try {
+                cancel(failure);
+            } finally {
+                reconcile();
+            }
         }
 
         private void processorFailed(Exception failure) {
             logger.warn(() -> "task processor failed unexpectedly for task [" + taskId + "]", failure);
-            cancel(new IllegalStateException("task processor failed for task [" + taskId + "]", failure));
+            try {
+                cancel(new IllegalStateException("task processor failed for task [" + taskId + "]", failure));
+            } finally {
+                reconcile();
+            }
         }
 
         private void cancel(Exception failure) {
@@ -431,20 +439,11 @@ public abstract class TaskProcessorRuntime<S> {
                 current -> current.closed() ? current : new LocalState<>(current.state(), true, false, null)
             );
             if (previous.closed() == false) {
-                try {
-                    TaskProcessorRuntime.this.cancel(this);
-                } catch (Exception e) {
-                    logger.warn(() -> "task processor failed to cancel task [" + taskId + "]", e);
-                }
+                TaskProcessorRuntime.this.cancel(this);
                 if (previous.updateListener() != null) {
-                    try {
-                        previous.updateListener().onFailure(failure);
-                    } catch (Exception e) {
-                        logger.warn(() -> "state-change listener failed while cancelling task [" + taskId + "]", e);
-                    }
+                    previous.updateListener().onFailure(failure);
                 }
             }
-            reconcile();
         }
     }
 }
