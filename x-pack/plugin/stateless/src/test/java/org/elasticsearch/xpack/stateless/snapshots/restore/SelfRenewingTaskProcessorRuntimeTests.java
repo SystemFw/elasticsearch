@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.common.util.Result;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
@@ -15,7 +16,6 @@ import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
-import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.RenewalResult;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -382,18 +382,18 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<RenewalResult>> listener) {
+        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener) {
             bulkRenewCount++;
             renewedLeases.addAll(leases);
             if (failRenewalsWithLeaseLoss) {
                 listener.onResponse(
-                    leases.stream().map(ignored -> RenewalResult.failure(new LeaseLostException("simulated fencing"))).toList()
+                    leases.stream().map(ignored -> Result.<Lease, Exception>failure(new LeaseLostException("simulated fencing"))).toList()
                 );
             } else if (completeRenewals) {
                 listener.onResponse(
                     leases.stream()
                         .map(
-                            lease -> RenewalResult.success(
+                            lease -> Result.<Lease, Exception>of(
                                 new Lease(
                                     lease.taskId(),
                                     lease.ownerId(),
