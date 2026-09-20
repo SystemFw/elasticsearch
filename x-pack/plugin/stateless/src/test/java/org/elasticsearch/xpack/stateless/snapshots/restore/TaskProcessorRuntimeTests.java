@@ -105,6 +105,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         assertSame(queue.updateFailure, updateFailure.get());
         assertSame(executionRef.get(), cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
+        assertThat(queue.releasedLeases.size(), equalTo(1));
 
         runtime.stopProcessing();
     }
@@ -347,6 +348,26 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         // The queue operation may still have committed even though its successful response arrived after cancellation.
         queue.completeFinish();
         assertThat(queue.states.get("task"), equalTo("finished"));
+
+        runtime.stopProcessing();
+    }
+
+    public void testProcessorFailureCancelsTask() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> {
+            throw new RuntimeException("simulated processor failure");
+        }, cancelledTask::set));
+
+        runtime.startProcessing();
+        deterministicTaskQueue.runAllRunnableTasks();
+
+        assertNotNull(cancelledTask.get());
+        assertThat(cancelledTask.get().state(), equalTo("initial"));
+        assertThat(runtime.activeTaskCount(), equalTo(0));
+        assertThat(queue.releasedLeases.size(), equalTo(1));
 
         runtime.stopProcessing();
     }

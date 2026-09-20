@@ -179,7 +179,7 @@ public abstract class TaskProcessorRuntime<S> {
                         tasks.put(lease.taskId(), task);
                         toStart.add(task);
                     } else {
-                        toRelease.add(lease);
+                         toRelease.add(lease);
                     }
                 }
 
@@ -205,9 +205,13 @@ public abstract class TaskProcessorRuntime<S> {
                 final Iterator<ActiveTask> taskIterator = tasks.values().iterator();
                 while (taskIterator.hasNext()) {
                     final ActiveTask task = taskIterator.next();
-                    if (task.isClosed()) {
+                    final LocalState<S> taskState = task.localState.get();
+                    if (taskState.closed()) {
                         taskIterator.remove();
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
+                        if (taskState.terminalUpdate() == false) {
+                            toRelease.add(task.lease);
+                        }
                         continue;
                     }
 
@@ -301,12 +305,12 @@ public abstract class TaskProcessorRuntime<S> {
     }
 
     private void startExecution(ActiveTask task) {
-        if (task.isClosed()) {
+        if (task.localState.get().closed()) {
             return;
         }
         try {
             processorExecutor.execute(() -> {
-                if (task.isClosed()) {
+                if (task.localState.get().closed()) {
                     return;
                 }
                 try {
@@ -368,10 +372,6 @@ public abstract class TaskProcessorRuntime<S> {
 
         private String taskId() {
             return taskId;
-        }
-
-        private boolean isClosed() {
-            return localState.get().closed();
         }
 
         @Override
