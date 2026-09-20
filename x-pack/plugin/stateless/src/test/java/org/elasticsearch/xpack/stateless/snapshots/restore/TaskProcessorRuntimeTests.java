@@ -18,7 +18,7 @@ import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.threadpool.Scheduler;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
+import org.elasticsearch.xpack.stateless.snapshots.restore.TaskProcessorRuntime.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 import org.mockito.ArgumentCaptor;
 
@@ -39,6 +39,12 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
 public class TaskProcessorRuntimeTests extends ESTestCase {
+
+    private interface TestProcessor<S> {
+        void process(TaskHandle<S> task) throws Exception;
+
+        void cancel(TaskHandle<S> task);
+    }
 
     public void testProcessorModifiesStateSequentiallyAndFinishes() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
@@ -376,7 +382,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
     private static TaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
-        Task<String> processor
+        TestProcessor<String> processor
     ) {
         return newRuntime(deterministicTaskQueue, queue, processor, 1);
     }
@@ -384,7 +390,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
     private static TaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
-        Task<String> processor,
+        TestProcessor<String> processor,
         int maxConcurrentTasks
     ) {
         return newRuntime(deterministicTaskQueue, queue, processor, maxConcurrentTasks, mock(ClusterService.class));
@@ -393,7 +399,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
     private static TaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
-        Task<String> processor,
+        TestProcessor<String> processor,
         int maxConcurrentTasks,
         ClusterService clusterService
     ) {
@@ -411,8 +417,8 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         );
     }
 
-    private static Task<String> processor(Consumer<TaskHandle<String>> process, Consumer<TaskHandle<String>> cancel) {
-        return new Task<>() {
+    private static TestProcessor<String> processor(Consumer<TaskHandle<String>> process, Consumer<TaskHandle<String>> cancel) {
+        return new TestProcessor<>() {
             @Override
             public void process(TaskHandle<String> task) {
                 process.accept(task);
@@ -427,12 +433,12 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
 
     private static class TestTaskProcessorRuntime extends TaskProcessorRuntime<String> {
 
-        private final Task<String> processor;
+        private final TestProcessor<String> processor;
 
         private TestTaskProcessorRuntime(
             ClusterService clusterService,
             TaskQueue<String> queue,
-            Task<String> processor,
+            TestProcessor<String> processor,
             ThreadPool threadPool,
             Executor processorExecutor,
             String workerId,

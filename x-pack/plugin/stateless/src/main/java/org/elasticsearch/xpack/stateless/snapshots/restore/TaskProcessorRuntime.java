@@ -17,7 +17,6 @@ import org.elasticsearch.core.Tuple;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 
 import java.util.ArrayList;
@@ -32,6 +31,16 @@ import java.util.concurrent.atomic.AtomicReference;
  * subclass.
  */
 public abstract class TaskProcessorRuntime<S> {
+
+    /** Access to one leased task. A task may have internal concurrency, but only one call to {@link #update} may be outstanding. */
+    public interface TaskHandle<S> {
+
+        /** Returns the state from the latest successful persistent state change. */
+        S state();
+
+        /** Persists a state change, making the task terminal when {@code terminal} is {@code true}. */
+        void update(S newState, boolean terminal, ActionListener<S> listener);
+    }
 
     private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
 

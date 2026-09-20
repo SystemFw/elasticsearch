@@ -8,14 +8,15 @@
 package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.component.LifecycleListener;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.threadpool.Scheduler;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 
 import java.util.List;
@@ -28,14 +29,25 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 
 /**
- * Alternative task runtime in which each active task manages its own lease renewal and expiry scheduling.
+ * Alternative task runtime in which each active task manages its own lease renewal and expiry scheduling. Instances must be fully
+ * constructed before the supplied {@link ClusterService} is started, so that lifecycle callbacks cannot reach a partially initialized
+ * subclass.
  */
-public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycleComponent {
+public abstract class SelfRenewingTaskProcessorRuntime<S> {
+
+    /** Access to one leased task. A task may have internal concurrency, but only one call to {@link #update} may be outstanding. */
+    public interface TaskHandle<S> {
+
+        /** Returns the state from the latest successful persistent state change. */
+        S state();
+
+        /** Persists a state change, making the task terminal when {@code terminal} is {@code true}. */
+        void update(S newState, boolean terminal, ActionListener<S> listener);
+    }
 
     private static final Logger logger = LogManager.getLogger(SelfRenewingTaskProcessorRuntime.class);
 
     private final TaskQueue<S> queue;
-    private final Task<S> processor;
     private final ThreadPool threadPool;
     private final Executor processorExecutor;
     private final String workerId;
@@ -48,10 +60,10 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
     private volatile boolean running;
     private volatile Scheduler.Cancellable claimPoller;
 
-    /** Creates a runtime for one task type and processor. */
-    public SelfRenewingTaskProcessorRuntime(
+    /** Creates a runtime for one task type. */
+    protected SelfRenewingTaskProcessorRuntime(
+        ClusterService clusterService,
         TaskQueue<S> queue,
-        Task<S> processor,
         ThreadPool threadPool,
         Executor processorExecutor,
         String workerId,
@@ -59,8 +71,8 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
         TimeValue leaseDuration,
         TimeValue claimInterval
     ) {
+        Objects.requireNonNull(clusterService);
         this.queue = Objects.requireNonNull(queue);
-        this.processor = Objects.requireNonNull(processor);
         this.threadPool = Objects.requireNonNull(threadPool);
         this.processorExecutor = Objects.requireNonNull(processorExecutor);
         this.workerId = Objects.requireNonNull(workerId);
@@ -78,17 +90,40 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
         this.maxConcurrentTasks = maxConcurrentTasks;
         this.leaseDuration = leaseDuration;
         this.claimInterval = claimInterval;
+        clusterService.addLifecycleListener(new LifecycleListener() {
+            @Override
+            public void afterStart() {
+                startProcessing();
+            }
+
+            @Override
+            public void beforeStop() {
+                stopProcessing();
+            }
+        });
     }
 
-    @Override
-    protected void doStart() {
+    /** Starts processing a claimed task. */
+    protected abstract void process(TaskHandle<S> task) throws Exception;
+
+    /** Stops processing a task whose lease is no longer owned by this runtime. */
+    protected abstract void cancel(TaskHandle<S> task);
+
+    // Exposed for tests that exercise the runtime independently of ClusterService.
+    void startProcessing() {
         running = true;
-        claimPoller = threadPool.scheduleWithFixedDelay(this::claimAvailableTasks, claimInterval, threadPool.generic());
+        try {
+            claimPoller = threadPool.scheduleWithFixedDelay(this::claimAvailableTasks, claimInterval, threadPool.generic());
+        } catch (EsRejectedExecutionException e) {
+            logger.debug("stopping task processor runtime because task queue polling was rejected", e);
+            stopProcessing();
+            return;
+        }
         claimAvailableTasks();
     }
 
-    @Override
-    protected void doStop() {
+    // Exposed for tests that exercise the runtime independently of ClusterService.
+    void stopProcessing() {
         running = false;
         final Scheduler.Cancellable poller = claimPoller;
         if (poller != null) {
@@ -98,9 +133,6 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             task.stopAndRelease();
         }
     }
-
-    @Override
-    protected void doClose() {}
 
     private void claimAvailableTasks() {
         if (running == false || claimInProgress.compareAndSet(false, true) == false) {
@@ -163,7 +195,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                     return;
                 }
                 try {
-                    processor.process(task);
+                    process(task);
                 } catch (Exception e) {
                     task.processorFailed(e);
                 }
@@ -175,7 +207,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
 
     private void cancelTask(ActiveTask task) {
         try {
-            processor.cancel(task);
+            cancel(task);
         } catch (Exception e) {
             logger.warn(() -> "task processor failed to cancel task [" + task.taskId + "]", e);
         }

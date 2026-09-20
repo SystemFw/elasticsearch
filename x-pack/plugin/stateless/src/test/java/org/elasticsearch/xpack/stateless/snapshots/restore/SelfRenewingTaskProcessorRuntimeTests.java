@@ -8,27 +8,40 @@
 package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.component.LifecycleListener;
 import org.elasticsearch.common.util.Result;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
-import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.xpack.stateless.snapshots.restore.SelfRenewingTaskProcessorRuntime.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
+import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
+
+    private interface TestProcessor<S> {
+        void process(TaskHandle<S> task) throws Exception;
+
+        void cancel(TaskHandle<S> task);
+    }
 
     public void testProcessorModifiesStateSequentiallyAndFinishes() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
@@ -38,7 +51,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var executionRef = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
 
         var execution = executionRef.get();
@@ -67,8 +80,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         assertThat(finalResult.get(), equalTo("finished"));
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testUpdateFailureCancelsTask() {
@@ -80,7 +92,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
 
         var updateFailure = new AtomicReference<Exception>();
@@ -91,8 +103,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         assertSame(executionRef.get(), cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testLeaseIsRenewedWhileProcessorIsActive() {
@@ -102,7 +113,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var executionRef = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, executionRef::set);
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
         assertNotNull(executionRef.get());
 
@@ -114,9 +125,8 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         assertThat(queue.bulkRenewCount, equalTo(0));
         assertThat(runtime.activeTaskCount(), equalTo(1));
 
-        runtime.stop();
+        runtime.stopProcessing();
         assertThat(queue.releasedLeases.size(), equalTo(1));
-        runtime.close();
     }
 
     public void testDueLeasesAreRenewedIndependently() {
@@ -126,7 +136,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         queue.add("task-2", "initial");
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> {}, ignored -> {}), 2);
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
 
         deterministicTaskQueue.advanceTime();
@@ -136,8 +146,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         assertThat(queue.singleRenewCount, equalTo(2));
         assertThat(queue.bulkRenewCount, equalTo(0));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testPartialClaimWaitsBeforePollingAgain() {
@@ -146,12 +155,11 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         queue.add("task", "initial");
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> {}, ignored -> {}), 2);
 
-        runtime.start();
+        runtime.startProcessing();
 
         assertThat(queue.claimCount, equalTo(1));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testHangingRenewalLosesLeaseAtLastConfirmedExpiry() {
@@ -163,7 +171,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
 
         deterministicTaskQueue.advanceTime(); // Renewal starts halfway through the lease and does not complete.
@@ -175,8 +183,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         assertSame(executionRef.get(), cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testRenewalFailureCancelsTask() {
@@ -188,7 +195,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
@@ -196,8 +203,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         assertSame(executionRef.get(), cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testRenewalFailureFailsPendingStateChange() {
@@ -210,7 +216,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
         var execution = executionRef.get();
         var stateChangeFailure = new AtomicReference<Exception>();
@@ -227,8 +233,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testRenewalFailureFailsPendingFinishImmediately() {
@@ -241,7 +246,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
         var execution = executionRef.get();
         var finishFailure = new AtomicReference<Exception>();
@@ -257,8 +262,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         queue.completeFinish();
         assertThat(queue.states.get("task"), equalTo("finished"));
 
-        runtime.stop();
-        runtime.close();
+        runtime.stopProcessing();
     }
 
     public void testStopReleasesActiveLease() {
@@ -269,14 +273,13 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
 
-        runtime.start();
+        runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();
-        runtime.stop();
+        runtime.stopProcessing();
 
         assertSame(executionRef.get(), cancelledTask.get());
         assertThat(queue.releasedLeases.size(), equalTo(1));
         assertThat(runtime.activeTaskCount(), equalTo(0));
-        runtime.close();
     }
 
     public void testClaimCompletingAfterStopIsReleasedWithoutStartingProcessor() {
@@ -287,14 +290,36 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var processCalled = new AtomicBoolean();
         var runtime = newRuntime(deterministicTaskQueue, queue, execution -> processCalled.set(true));
 
-        runtime.start();
-        runtime.stop();
+        runtime.startProcessing();
+        runtime.stopProcessing();
         queue.completeClaim();
         deterministicTaskQueue.runAllRunnableTasks();
 
         assertFalse(processCalled.get());
         assertThat(queue.releasedLeases.size(), equalTo(1));
-        runtime.close();
+    }
+
+    public void testFollowsClusterServiceLifecycle() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        var executionRef = new AtomicReference<TaskHandle<String>>();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        // A real ClusterService starts during test construction, before the runtime can register its lifecycle listener.
+        var clusterService = mock(ClusterService.class);
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set), 1, clusterService);
+        var lifecycleListener = ArgumentCaptor.forClass(LifecycleListener.class);
+        verify(clusterService).addLifecycleListener(lifecycleListener.capture());
+
+        assertThat(queue.claimCount, equalTo(0));
+        lifecycleListener.getValue().afterStart();
+        deterministicTaskQueue.runAllRunnableTasks();
+        assertNotNull(executionRef.get());
+
+        lifecycleListener.getValue().beforeStop();
+        assertSame(executionRef.get(), cancelledTask.get());
+        assertThat(queue.releasedLeases.size(), equalTo(1));
+        assertThat(runtime.activeTaskCount(), equalTo(0));
     }
 
     private static SelfRenewingTaskProcessorRuntime<String> newRuntime(
@@ -308,7 +333,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
     private static SelfRenewingTaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
-        Task<String> processor
+        TestProcessor<String> processor
     ) {
         return newRuntime(deterministicTaskQueue, queue, processor, 1);
     }
@@ -316,11 +341,22 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
     private static SelfRenewingTaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
-        Task<String> processor,
+        TestProcessor<String> processor,
         int maxConcurrentTasks
     ) {
+        return newRuntime(deterministicTaskQueue, queue, processor, maxConcurrentTasks, mock(ClusterService.class));
+    }
+
+    private static SelfRenewingTaskProcessorRuntime<String> newRuntime(
+        DeterministicTaskQueue deterministicTaskQueue,
+        TestTaskQueue queue,
+        TestProcessor<String> processor,
+        int maxConcurrentTasks,
+        ClusterService clusterService
+    ) {
         var threadPool = deterministicTaskQueue.getThreadPool();
-        return new SelfRenewingTaskProcessorRuntime<>(
+        return new TestTaskProcessorRuntime(
+            clusterService,
             queue,
             processor,
             threadPool,
@@ -332,8 +368,8 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         );
     }
 
-    private static Task<String> processor(Consumer<TaskHandle<String>> process, Consumer<TaskHandle<String>> cancel) {
-        return new Task<>() {
+    private static TestProcessor<String> processor(Consumer<TaskHandle<String>> process, Consumer<TaskHandle<String>> cancel) {
+        return new TestProcessor<>() {
             @Override
             public void process(TaskHandle<String> task) {
                 process.accept(task);
@@ -344,6 +380,36 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
                 cancel.accept(task);
             }
         };
+    }
+
+    private static class TestTaskProcessorRuntime extends SelfRenewingTaskProcessorRuntime<String> {
+
+        private final TestProcessor<String> processor;
+
+        private TestTaskProcessorRuntime(
+            ClusterService clusterService,
+            TaskQueue<String> queue,
+            TestProcessor<String> processor,
+            ThreadPool threadPool,
+            Executor processorExecutor,
+            String workerId,
+            int maxConcurrentTasks,
+            TimeValue leaseDuration,
+            TimeValue claimInterval
+        ) {
+            super(clusterService, queue, threadPool, processorExecutor, workerId, maxConcurrentTasks, leaseDuration, claimInterval);
+            this.processor = processor;
+        }
+
+        @Override
+        protected void process(TaskHandle<String> task) throws Exception {
+            processor.process(task);
+        }
+
+        @Override
+        protected void cancel(TaskHandle<String> task) {
+            processor.cancel(task);
+        }
     }
 
     private static class TestTaskQueue implements TaskQueue<String> {
