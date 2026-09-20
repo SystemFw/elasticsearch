@@ -169,13 +169,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                     }
 
                     if (task.renewalResult != null) {
-                        Lease renewedLease = null;
-                        Exception renewalFailure = null;
-                        try {
-                            renewedLease = task.renewalResult.get();
-                        } catch (Exception e) {
-                            renewalFailure = e;
-                        }
+                        final Lease renewedLease = task.renewalResult.asOptional().orElse(null);
+                        final Exception renewalFailure = task.renewalResult.failure().orElse(null);
                         final boolean validRenewal = renewalFailure == null
                             && renewedLease != null
                             && sameLeaseIncarnation(task.lease, renewedLease)
@@ -263,11 +258,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         final ActionListener<List<Tuple<S, Lease>>> listener = ActionListener.assertOnce(
             ActionListener.wrap(this::claimsCompleted, this::claimFailed)
         );
-        try {
-            queue.claim(workerId, capacity, leaseDuration, listener);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
+        queue.claim(workerId, capacity, leaseDuration, listener);
     }
 
     private void claimsCompleted(List<Tuple<S, Lease>> claimedTasks) {
@@ -284,11 +275,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         final ActionListener<List<Result<Lease, Exception>>> listener = ActionListener.assertOnce(
             ActionListener.wrap(results -> renewalsCompleted(renewals, results), failure -> renewalsFailed(renewals, failure))
         );
-        try {
-            queue.renew(leases, leaseDuration, listener);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
+        queue.renew(leases, leaseDuration, listener);
     }
 
     private void renewalsCompleted(List<Tuple<ActiveTask, Lease>> renewals, List<Result<Lease, Exception>> results) {
@@ -337,14 +324,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
     }
 
-    private void update(Lease lease, S newState, boolean terminal, ActionListener<S> listener) {
-        try {
-            queue.update(lease, newState, terminal, listener);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
-    }
-
     private void closeAndCancel(ActiveTask task, Exception failure) {
         final LocalState<S> previous = task.close();
         if (previous != null) {
@@ -368,11 +347,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             ignored -> {},
             failure -> logger.debug(() -> "failed to release lease for task [" + lease.taskId() + "]", failure)
         );
-        try {
-            queue.release(lease, listener);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
+        queue.release(lease, listener);
     }
 
     private static boolean sameLeaseIncarnation(Lease current, Lease renewed) {
@@ -465,7 +440,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             if (threadPool.absoluteTimeInMillis() >= lease.expiryMillis()) {
                 operationListener.onFailure(new LeaseLostException("lease for task [" + taskId + "] has expired"));
             } else {
-                TaskProcessorRuntime.this.update(lease, newState, terminal, operationListener);
+                queue.update(lease, newState, terminal, operationListener);
             }
         }
 

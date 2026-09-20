@@ -20,7 +20,8 @@ import java.util.List;
  * <p>
  * Implementations must validate the lease identity for every operation other than {@link #claim}. Renewal and state changes must also
  * require the task to be nonterminal. Finishing a task atomically stores its final state, makes it terminal, and removes its lease. The
- * final state determines whether the terminal outcome represents success or failure.
+ * final state determines whether the terminal outcome represents success or failure. All failures must be reported to the supplied
+ * listener; these methods must not throw exceptions.
  */
 public interface TaskQueue<S> {
 
