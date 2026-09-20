@@ -169,15 +169,20 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                     }
 
                     if (task.renewalResult != null) {
-                        final Lease renewedLease = task.renewalResult.asOptional().orElse(null);
+                        final Long renewedExpiryMillis = task.renewalResult.asOptional().orElse(null);
                         final Exception renewalFailure = task.renewalResult.failure().orElse(null);
                         final boolean validRenewal = renewalFailure == null
-                            && renewedLease != null
-                            && sameLeaseIncarnation(task.lease, renewedLease)
-                            && renewedLease.expiryMillis() > nowMillis;
+                            && renewedExpiryMillis != null
+                            && renewedExpiryMillis > nowMillis;
                         if (validRenewal) {
+                            final Lease renewedLease = new Lease(
+                                task.lease.taskId(),
+                                task.lease.ownerId(),
+                                task.lease.fencingToken(),
+                                renewedExpiryMillis
+                            );
                             task.lease = renewedLease;
-                            task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
+                            task.renewAtMillis = renewalTime(nowMillis, renewedExpiryMillis);
                             task.renewalInProgress = false;
                             task.renewalResult = null;
                         } else if (renewalFailure != null
@@ -272,13 +277,13 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
     private void renew(List<Tuple<ActiveTask, Lease>> renewals) {
         final List<Lease> leases = renewals.stream().map(Tuple::v2).toList();
-        final ActionListener<List<Result<Lease, Exception>>> listener = ActionListener.assertOnce(
+        final ActionListener<List<Result<Long, Exception>>> listener = ActionListener.assertOnce(
             ActionListener.wrap(results -> renewalsCompleted(renewals, results), failure -> renewalsFailed(renewals, failure))
         );
         queue.renew(leases, leaseDuration, listener);
     }
 
-    private void renewalsCompleted(List<Tuple<ActiveTask, Lease>> renewals, List<Result<Lease, Exception>> results) {
+    private void renewalsCompleted(List<Tuple<ActiveTask, Lease>> renewals, List<Result<Long, Exception>> results) {
         if (results == null || results.size() != renewals.size() || results.stream().anyMatch(Objects::isNull)) {
             renewalsFailed(renewals, new IllegalStateException("queue returned an invalid bulk renewal response"));
             return;
@@ -290,7 +295,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private void renewalsFailed(List<Tuple<ActiveTask, Lease>> renewals, Exception failure) {
         reconcile(
             null,
-            new RenewalBatch(renewals, renewals.stream().map(ignored -> Result.<Lease, Exception>failure(failure)).toList()),
+            new RenewalBatch(renewals, renewals.stream().map(ignored -> Result.<Long, Exception>failure(failure)).toList()),
             null
         );
     }
@@ -350,12 +355,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         queue.release(lease, listener);
     }
 
-    private static boolean sameLeaseIncarnation(Lease current, Lease renewed) {
-        return current.taskId().equals(renewed.taskId())
-            && current.ownerId().equals(renewed.ownerId())
-            && current.fencingToken() == renewed.fencingToken();
-    }
-
     private static long renewalTime(long nowMillis, long expiryMillis) {
         return nowMillis + Math.max(1L, (expiryMillis - nowMillis) / 2L);
     }
@@ -368,9 +367,9 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private final class RenewalBatch {
 
         private final List<Tuple<ActiveTask, Lease>> renewals;
-        private final List<Result<Lease, Exception>> results;
+        private final List<Result<Long, Exception>> results;
 
-        private RenewalBatch(List<Tuple<ActiveTask, Lease>> renewals, List<Result<Lease, Exception>> results) {
+        private RenewalBatch(List<Tuple<ActiveTask, Lease>> renewals, List<Result<Long, Exception>> results) {
             this.renewals = renewals;
             this.results = results;
         }
@@ -386,7 +385,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         // Accessed only by reconciliation under mutex.
         private long renewAtMillis;
         private boolean renewalInProgress;
-        private Result<Lease, Exception> renewalResult;
+        private Result<Long, Exception> renewalResult;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
             this.taskId = lease.taskId();

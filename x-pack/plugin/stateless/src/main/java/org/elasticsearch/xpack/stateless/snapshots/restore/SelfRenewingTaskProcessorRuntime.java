@@ -194,12 +194,6 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
         }
     }
 
-    private static boolean sameLeaseIncarnation(Lease current, Lease renewed) {
-        return current.taskId().equals(renewed.taskId())
-            && current.ownerId().equals(renewed.ownerId())
-            && current.fencingToken() == renewed.fencingToken();
-    }
-
     // Exposed for comparison tests.
     int activeTaskCount() {
         return activeTasks.size();
@@ -384,8 +378,11 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 return;
             }
 
-            final ActionListener<Lease> listener = ActionListener.assertOnce(
-                ActionListener.wrap(renewedLease -> leaseRenewed(lease, renewedLease), failure -> leaseRenewalFailed(lease, failure))
+            final ActionListener<Long> listener = ActionListener.assertOnce(
+                ActionListener.wrap(
+                    renewedExpiryMillis -> leaseRenewed(lease, renewedExpiryMillis),
+                    failure -> leaseRenewalFailed(lease, failure)
+                )
             );
             try {
                 queue.renew(lease, leaseDuration, listener);
@@ -394,17 +391,21 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             }
         }
 
-        private void leaseRenewed(Lease previousLease, Lease renewedLease) {
+        private void leaseRenewed(Lease previousLease, long renewedExpiryMillis) {
             final long nowMillis = threadPool.absoluteTimeInMillis();
-            if (renewedLease == null
-                || sameLeaseIncarnation(previousLease, renewedLease) == false
-                || renewedLease.expiryMillis() <= nowMillis) {
+            if (renewedExpiryMillis <= nowMillis) {
                 closeAndCancel(
                     state -> state.lease() == previousLease && state.renewalInProgress(),
                     new LeaseLostException("queue returned an invalid renewed lease for task [" + taskId + "]")
                 );
                 return;
             }
+            final Lease renewedLease = new Lease(
+                previousLease.taskId(),
+                previousLease.ownerId(),
+                previousLease.fencingToken(),
+                renewedExpiryMillis
+            );
 
             final TaskState<S> previous = taskState.getAndUpdate(current -> {
                 if (current.closed() || current.lease() != previousLease || current.renewalInProgress() == false) {

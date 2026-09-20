@@ -52,14 +52,14 @@ public interface TaskQueue<S> {
     /** Claims up to {@code maxTasks} available tasks for {@code ownerId}, replacing any expired leases. */
     void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<Tuple<S, Lease>>> listener);
 
-    /** Renews a live lease and returns its new expiry. */
-    void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener);
+    /** Renews a live lease and returns its new absolute expiry in milliseconds. */
+    void renew(Lease lease, TimeValue leaseDuration, ActionListener<Long> listener);
 
     /**
      * Renews live leases in bulk. The response must contain one result per input lease, in the same order. A request-level failure is
      * reported to {@code listener}; failures affecting individual leases are returned as item results.
      */
-    void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener);
+    void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Long, Exception>>> listener);
 
     /** Replaces the task-specific persistent state, optionally making the task terminal and removing its lease. */
     void update(Lease lease, S newState, boolean terminal, ActionListener<S> listener);
