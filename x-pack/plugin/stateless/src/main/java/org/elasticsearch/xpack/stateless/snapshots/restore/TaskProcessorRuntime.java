@@ -40,6 +40,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private final int maxConcurrentTasks;
     private final TimeValue leaseDuration;
     private final TimeValue claimInterval;
+    private final long renewalBatchWindowMillis;
 
     private final Object mutex = new Object();
     private final List<ActiveTask> tasks = new ArrayList<>();
@@ -81,6 +82,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         this.maxConcurrentTasks = maxConcurrentTasks;
         this.leaseDuration = leaseDuration;
         this.claimInterval = claimInterval;
+        this.renewalBatchWindowMillis = Math.min(claimInterval.millis(), Math.max(1L, leaseDuration.millis() / 10L));
     }
 
     @Override
@@ -160,6 +162,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 nextClaimAtMillis = Long.MAX_VALUE;
                 wakeAtMillis = Long.MAX_VALUE;
             } else {
+                boolean renewalDue = false;
                 for (int i = tasks.size() - 1; i >= 0; i--) {
                     final ActiveTask task = tasks.get(i);
                     if (task.isClosed()) {
@@ -184,6 +187,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                             task.lease = renewedLease;
                             task.renewAtMillis = renewalTime(nowMillis, renewedExpiryMillis);
                             task.renewalInProgress = false;
+                            task.renewalRetryPending = false;
                             task.renewalResult = null;
                         } else if (renewalFailure != null
                             && renewalFailure instanceof LeaseLostException == false
@@ -192,6 +196,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                                 final long remainingMillis = task.lease.expiryMillis() - nowMillis;
                                 task.renewAtMillis = nowMillis + Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
                                 task.renewalInProgress = false;
+                                task.renewalRetryPending = true;
                                 task.renewalResult = null;
                             } else {
                                 tasks.remove(i);
@@ -216,8 +221,20 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
                         toCancel.add(new Tuple<>(task, new LeaseLostException("lease for task [" + task.taskId() + "] has expired")));
                     } else if (task.renewalInProgress == false && nowMillis >= task.renewAtMillis) {
-                        task.renewalInProgress = true;
-                        toRenew.add(new Tuple<>(task, task.lease));
+                        renewalDue = true;
+                    }
+                }
+
+                if (renewalDue) {
+                    final long renewalCutoffMillis = nowMillis + renewalBatchWindowMillis;
+                    for (ActiveTask task : tasks) {
+                        if (task.renewalInProgress == false
+                            && (task.renewAtMillis <= nowMillis
+                                || task.renewalRetryPending == false && task.renewAtMillis <= renewalCutoffMillis)) {
+                            task.renewalInProgress = true;
+                            task.renewalRetryPending = false;
+                            toRenew.add(new Tuple<>(task, task.lease));
+                        }
                     }
                 }
 
@@ -385,6 +402,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         // Accessed only by reconciliation under mutex.
         private long renewAtMillis;
         private boolean renewalInProgress;
+        private boolean renewalRetryPending;
         private Result<Long, Exception> renewalResult;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {

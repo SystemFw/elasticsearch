@@ -96,11 +96,12 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
-    public void testDueLeasesAreRenewedInOneBatch() {
+    public void testNearDueLeasesAreRenewedInOneBatch() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task-1", "initial");
         queue.add("task-2", "initial");
+        queue.claimedLeaseExpiryStepMillis = 10L;
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> {}, ignored -> {}), 2);
 
         runtime.start();
@@ -110,6 +111,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         deterministicTaskQueue.runAllRunnableTasks();
 
         assertThat(queue.renewedLeases.size(), equalTo(2));
+        assertNotEquals(queue.renewedLeases.get(0).expiryMillis(), queue.renewedLeases.get(1).expiryMillis());
         assertThat(queue.singleRenewCount, equalTo(0));
         assertThat(queue.bulkRenewCount, equalTo(1));
 
@@ -343,6 +345,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private boolean completeRenewals = true;
         private boolean failRenewalsWithLeaseLoss;
         private String leaseLostOnRenewalTaskId;
+        private long claimedLeaseExpiryStepMillis;
         private ActionListener<List<Tuple<String, Lease>>> pendingClaim;
         private PendingModification pendingModification;
         private PendingModification pendingFinish;
@@ -381,7 +384,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
                     task.getKey(),
                     ownerId,
                     nextFencingToken++,
-                    deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
+                    deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis() + result.size() * claimedLeaseExpiryStepMillis
                 );
                 result.add(new Tuple<>(states.get(task.getKey()), lease));
             }
