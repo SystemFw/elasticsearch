@@ -24,6 +24,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -71,7 +72,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             false,
             ActionListener.wrap(ignored -> fail("second modification unexpectedly succeeded"), concurrentFailure::set)
         );
-        assertThat(concurrentFailure.get(), instanceOf(IllegalStateException.class));
+        assertThat(concurrentFailure.get(), instanceOf(ConcurrentModificationException.class));
         assertThat(execution.state(), equalTo("initial"));
 
         queue.completeModification();

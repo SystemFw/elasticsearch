@@ -20,6 +20,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 
 import java.util.ArrayList;
+import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -385,21 +386,18 @@ public abstract class TaskProcessorRuntime<S> {
         public void update(S newState, boolean terminal, ActionListener<S> listener) {
             final LocalState<S> current = localState.get();
             if (current.closed()) {
-                listener.onFailure(new IllegalStateException("lease for task [" + taskId + "] is no longer active"));
+                listener.onFailure(new InterruptedException());
                 return;
             }
             if (current.updateListener() != null) {
-                listener.onFailure(new IllegalStateException("task [" + taskId + "] already has a persistent state change in progress"));
+                listener.onFailure(new ConcurrentModificationException());
                 return;
             }
 
             final LocalState<S> pendingUpdate = new LocalState<>(current.state(), false, terminal, listener);
             final LocalState<S> witness = localState.compareAndExchange(current, pendingUpdate);
             if (witness != current) {
-                final Exception failure = witness.closed()
-                    ? new IllegalStateException("lease for task [" + taskId + "] is no longer active")
-                    : new IllegalStateException("task [" + taskId + "] changed concurrently while starting a persistent state change");
-                listener.onFailure(failure);
+                listener.onFailure(witness.closed() ? new InterruptedException() : new ConcurrentModificationException());
                 return;
             }
 
