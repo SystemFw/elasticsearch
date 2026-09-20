@@ -504,7 +504,17 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
             TimeValue leaseDuration,
             TimeValue claimInterval
         ) {
-            super(clusterService, queue, threadPool, processorExecutor, workerId, maxConcurrentTasks, leaseDuration, claimInterval);
+            super(
+                clusterService,
+                queue,
+                threadPool,
+                processorExecutor,
+                workerId,
+                maxConcurrentTasks,
+                leaseDuration,
+                claimInterval,
+                TimeValue.timeValueMillis(0)
+            );
             this.processor = processor;
         }
 

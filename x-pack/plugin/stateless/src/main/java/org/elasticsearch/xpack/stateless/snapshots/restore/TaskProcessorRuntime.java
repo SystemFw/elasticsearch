@@ -60,7 +60,8 @@ public abstract class TaskProcessorRuntime<S> {
         String workerId,
         int maxConcurrentTasks,
         TimeValue leaseDuration,
-        TimeValue claimInterval
+        TimeValue claimInterval,
+        TimeValue shutdownGracePeriod
     ) {
         Objects.requireNonNull(clusterService);
         this.queue = Objects.requireNonNull(queue);
@@ -69,6 +70,7 @@ public abstract class TaskProcessorRuntime<S> {
         this.workerId = Objects.requireNonNull(workerId);
         Objects.requireNonNull(leaseDuration);
         Objects.requireNonNull(claimInterval);
+        Objects.requireNonNull(shutdownGracePeriod);
         if (maxConcurrentTasks <= 0) {
             throw new IllegalArgumentException("maximum concurrent tasks must be positive");
         }
@@ -81,7 +83,7 @@ public abstract class TaskProcessorRuntime<S> {
         this.maxConcurrentTasks = maxConcurrentTasks;
         this.leaseDuration = leaseDuration;
         this.claimInterval = claimInterval;
-        this.renewalBatchWindowMillis = Math.min(claimInterval.millis(), Math.max(1L, leaseDuration.millis() / 10L));
+        this.renewalBatchWindowMillis = Math.clamp(leaseDuration.millis() / 10L, 1L, claimInterval.millis());
         clusterService.addLifecycleListener(new LifecycleListener() {
             @Override
             public void afterStart() {
@@ -91,6 +93,9 @@ public abstract class TaskProcessorRuntime<S> {
             @Override
             public void beforeStop() {
                 stopProcessing();
+                try {
+                    Thread.sleep(shutdownGracePeriod.toDuration());
+                } catch (InterruptedException e) {}
             }
         });
     }
