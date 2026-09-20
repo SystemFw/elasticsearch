@@ -340,24 +340,6 @@ public abstract class TaskProcessorRuntime<S> {
         }
     }
 
-    private void closeAndCancel(ActiveTask task, Exception failure) {
-        final LocalState<S> previous = task.close();
-        if (previous != null) {
-            try {
-                cancel(task);
-            } catch (Exception e) {
-                logger.warn(() -> "task processor failed to cancel task [" + task.taskId() + "]", e);
-            }
-            if (previous.updateListener() != null) {
-                try {
-                    previous.updateListener().onFailure(failure);
-                } catch (Exception e) {
-                    logger.warn(() -> "state-change listener failed while cancelling task [" + task.taskId() + "]", e);
-                }
-            }
-        }
-    }
-
     private void release(Lease lease) {
         final ActionListener<Void> listener = ActionListener.wrap(
             ignored -> {},
@@ -464,15 +446,24 @@ public abstract class TaskProcessorRuntime<S> {
         }
 
         private void cancel(Exception failure) {
-            closeAndCancel(this, failure);
-            reconcile(null, null);
-        }
-
-        private LocalState<S> close() {
             final LocalState<S> previous = localState.getAndUpdate(
                 current -> current.closed() ? current : new LocalState<>(current.state(), true, false, null)
             );
-            return previous.closed() ? null : previous;
+            if (previous.closed() == false) {
+                try {
+                    TaskProcessorRuntime.this.cancel(this);
+                } catch (Exception e) {
+                    logger.warn(() -> "task processor failed to cancel task [" + taskId + "]", e);
+                }
+                if (previous.updateListener() != null) {
+                    try {
+                        previous.updateListener().onFailure(failure);
+                    } catch (Exception e) {
+                        logger.warn(() -> "state-change listener failed while cancelling task [" + taskId + "]", e);
+                    }
+                }
+            }
+            reconcile(null, null);
         }
     }
 }
