@@ -42,26 +42,11 @@ public abstract class TaskProcessorRuntime<S> {
         void update(S newState, boolean terminal, ActionListener<S> listener);
     }
 
-    private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
+    /** Starts processing a claimed task. */
+    protected abstract void process(TaskHandle<S> task) throws Exception;
 
-    private final TaskQueue<S> queue;
-    private final ThreadPool threadPool;
-    private final Executor processorExecutor;
-    private final String workerId;
-    private final int maxConcurrentTasks;
-    private final TimeValue leaseDuration;
-    private final TimeValue claimInterval;
-    private final long renewalBatchWindowMillis;
-
-    private final Object mutex = new Object();
-    private final List<ActiveTask> tasks = new ArrayList<>();
-    private volatile boolean running;
-    private boolean claimInProgress;
-    private long nextClaimAtMillis;
-    private long wakeAtMillis = Long.MAX_VALUE;
-    private volatile int taskCount;
-
-    private record LocalState<T>(T state, boolean closed, boolean terminalUpdate, ActionListener<T> updateListener) {}
+    /** Stops processing a task whose lease is no longer owned by this runtime. */
+    protected abstract void cancel(TaskHandle<S> task);
 
     /** Creates a runtime for one task type. */
     protected TaskProcessorRuntime(
@@ -107,11 +92,23 @@ public abstract class TaskProcessorRuntime<S> {
         });
     }
 
-    /** Starts processing a claimed task. */
-    protected abstract void process(TaskHandle<S> task) throws Exception;
+    private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
+    private final TaskQueue<S> queue;
+    private final ThreadPool threadPool;
+    private final Executor processorExecutor;
+    private final String workerId;
+    private final int maxConcurrentTasks;
+    private final TimeValue leaseDuration;
+    private final TimeValue claimInterval;
+    private final long renewalBatchWindowMillis;
 
-    /** Stops processing a task whose lease is no longer owned by this runtime. */
-    protected abstract void cancel(TaskHandle<S> task);
+    private final Object mutex = new Object();
+    private final List<ActiveTask> tasks = new ArrayList<>();
+    private volatile boolean running;
+    private boolean claimInProgress;
+    private long nextClaimAtMillis;
+    private long wakeAtMillis = Long.MAX_VALUE;
+    private volatile int taskCount;
 
     // Exposed for tests that exercise the runtime independently of ClusterService.
     void startProcessing() {
@@ -377,6 +374,8 @@ public abstract class TaskProcessorRuntime<S> {
     int activeTaskCount() {
         return taskCount;
     }
+
+    private record LocalState<T>(T state, boolean closed, boolean terminalUpdate, ActionListener<T> updateListener) {}
 
     /** Local state for one active lease incarnation. */
     private final class ActiveTask implements TaskHandle<S> {

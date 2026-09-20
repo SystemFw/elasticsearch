@@ -45,20 +45,11 @@ public abstract class SelfRenewingTaskProcessorRuntime<S> {
         void update(S newState, boolean terminal, ActionListener<S> listener);
     }
 
-    private static final Logger logger = LogManager.getLogger(SelfRenewingTaskProcessorRuntime.class);
+    /** Starts processing a claimed task. */
+    protected abstract void process(TaskHandle<S> task) throws Exception;
 
-    private final TaskQueue<S> queue;
-    private final ThreadPool threadPool;
-    private final Executor processorExecutor;
-    private final String workerId;
-    private final int maxConcurrentTasks;
-    private final TimeValue leaseDuration;
-    private final TimeValue claimInterval;
-    private final Set<ActiveTask> activeTasks = ConcurrentHashMap.newKeySet();
-    private final AtomicBoolean claimInProgress = new AtomicBoolean();
-
-    private volatile boolean running;
-    private volatile Scheduler.Cancellable claimPoller;
+    /** Stops processing a task whose lease is no longer owned by this runtime. */
+    protected abstract void cancel(TaskHandle<S> task);
 
     /** Creates a runtime for one task type. */
     protected SelfRenewingTaskProcessorRuntime(
@@ -103,11 +94,20 @@ public abstract class SelfRenewingTaskProcessorRuntime<S> {
         });
     }
 
-    /** Starts processing a claimed task. */
-    protected abstract void process(TaskHandle<S> task) throws Exception;
+    private static final Logger logger = LogManager.getLogger(SelfRenewingTaskProcessorRuntime.class);
 
-    /** Stops processing a task whose lease is no longer owned by this runtime. */
-    protected abstract void cancel(TaskHandle<S> task);
+    private final TaskQueue<S> queue;
+    private final ThreadPool threadPool;
+    private final Executor processorExecutor;
+    private final String workerId;
+    private final int maxConcurrentTasks;
+    private final TimeValue leaseDuration;
+    private final TimeValue claimInterval;
+    private final Set<ActiveTask> activeTasks = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean claimInProgress = new AtomicBoolean();
+
+    private volatile boolean running;
+    private volatile Scheduler.Cancellable claimPoller;
 
     // Exposed for tests that exercise the runtime independently of ClusterService.
     void startProcessing() {
