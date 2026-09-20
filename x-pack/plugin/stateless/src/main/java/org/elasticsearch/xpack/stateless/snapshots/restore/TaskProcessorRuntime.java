@@ -113,19 +113,27 @@ public abstract class TaskProcessorRuntime<S> {
     // Exposed for tests that exercise the runtime independently of ClusterService.
     void startProcessing() {
         running = true;
-        reconcile(null, null);
+        reconcile();
     }
 
     // Exposed for tests that exercise the runtime independently of ClusterService.
     void stopProcessing() {
         running = false;
-        reconcile(null, null);
+        reconcile();
+    }
+
+    private void reconcile() {
+        reconcile(false, List.of(), List.of());
     }
 
     /**
      * Reconciles all runtime-owned state under one short critical section. Queue, processor and scheduler calls are dispatched afterwards.
      */
-    private void reconcile(List<Tuple<S, Lease>> claimedTasks, List<Tuple<ActiveTask, Result<Lease, Exception>>> renewals) {
+    private void reconcile(
+        boolean claimCompleted,
+        List<Tuple<S, Lease>> claimedTasks,
+        List<Tuple<ActiveTask, Result<Lease, Exception>>> renewals
+    ) {
         final List<Tuple<ActiveTask, Lease>> toRenew = new ArrayList<>();
         final List<Tuple<ActiveTask, Exception>> toCancel = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
@@ -139,14 +147,8 @@ public abstract class TaskProcessorRuntime<S> {
                 wakeAtMillis = Long.MAX_VALUE;
             }
 
-            if (claimedTasks != null) {
-                claimInProgress = false;
-            }
-
             if (running == false) {
-                if (claimedTasks != null) {
-                    claimedTasks.forEach(task -> toRelease.add(task.v2()));
-                }
+                claimedTasks.forEach(task -> toRelease.add(task.v2()));
                 for (ActiveTask task : tasks) {
                     toCancel.add(
                         new Tuple<>(task, new IllegalStateException("runtime stopped while processing task [" + task.taskId() + "]"))
@@ -157,23 +159,24 @@ public abstract class TaskProcessorRuntime<S> {
                 nextClaimAtMillis = Long.MAX_VALUE;
                 wakeAtMillis = Long.MAX_VALUE;
             } else {
-                if (claimedTasks != null) {
-                    for (Tuple<S, Lease> claimedTask : claimedTasks) {
-                        final Lease lease = claimedTask.v2();
-                        if (lease.expiryMillis() > nowMillis) {
-                            final var task = new ActiveTask(claimedTask.v1(), lease, renewalTime(nowMillis, lease.expiryMillis()));
-                            tasks.add(task);
-                            toStart.add(task);
-                        } else {
-                            toRelease.add(lease);
-                        }
-                    }
+                if (claimCompleted) {
+                    claimInProgress = false;
                     nextClaimAtMillis = nowMillis + claimInterval.millis();
-                } else if (renewals != null) {
-                    for (Tuple<ActiveTask, Result<Lease, Exception>> renewal : renewals) {
-                        if (renewal.v1().renewalInProgress && renewal.v1().renewalResult == null) {
-                            renewal.v1().renewalResult = renewal.v2();
-                        }
+                }
+                for (Tuple<S, Lease> claimedTask : claimedTasks) {
+                    final Lease lease = claimedTask.v2();
+                    if (lease.expiryMillis() > nowMillis) {
+                        final var task = new ActiveTask(claimedTask.v1(), lease, renewalTime(nowMillis, lease.expiryMillis()));
+                        tasks.add(task);
+                        toStart.add(task);
+                    } else {
+                        toRelease.add(lease);
+                    }
+                }
+
+                for (Tuple<ActiveTask, Result<Lease, Exception>> renewal : renewals) {
+                    if (renewal.v1().renewalInProgress && renewal.v1().renewalResult == null) {
+                        renewal.v1().renewalResult = renewal.v2();
                     }
                 }
 
@@ -273,12 +276,12 @@ public abstract class TaskProcessorRuntime<S> {
     }
 
     private void claimsCompleted(List<Tuple<S, Lease>> claimedTasks) {
-        reconcile(claimedTasks, null);
+        reconcile(true, claimedTasks, List.of());
     }
 
     private void claimFailed(Exception failure) {
         logger.debug("failed to claim queued tasks", failure);
-        reconcile(List.of(), null);
+        reconcile(true, List.of(), List.of());
     }
 
     private void renew(List<Tuple<ActiveTask, Lease>> renewals) {
@@ -299,7 +302,7 @@ public abstract class TaskProcessorRuntime<S> {
         for (int i = 0; i < renewals.size(); i++) {
             completedRenewals.add(new Tuple<>(renewals.get(i).v1(), results.get(i)));
         }
-        reconcile(null, completedRenewals);
+        reconcile(false, List.of(), completedRenewals);
     }
 
     private void renewalsFailed(List<Tuple<ActiveTask, Lease>> renewals, Exception failure) {
@@ -307,7 +310,7 @@ public abstract class TaskProcessorRuntime<S> {
         for (Tuple<ActiveTask, Lease> renewal : renewals) {
             failedRenewals.add(new Tuple<>(renewal.v1(), Result.failure(failure)));
         }
-        reconcile(null, failedRenewals);
+        reconcile(false, List.of(), failedRenewals);
     }
 
     private void startExecution(ActiveTask task) {
@@ -333,7 +336,7 @@ public abstract class TaskProcessorRuntime<S> {
     private void scheduleWake(long atMillis) {
         final long delayMillis = Math.max(1L, atMillis - threadPool.absoluteTimeInMillis());
         try {
-            threadPool.schedule(() -> reconcile(null, null), TimeValue.timeValueMillis(delayMillis), threadPool.generic());
+            threadPool.schedule(this::reconcile, TimeValue.timeValueMillis(delayMillis), threadPool.generic());
         } catch (EsRejectedExecutionException e) {
             logger.debug("stopping task processor runtime because task queue maintenance was rejected", e);
             stopProcessing();
@@ -431,7 +434,7 @@ public abstract class TaskProcessorRuntime<S> {
             }
 
             if (completed.closed()) {
-                reconcile(null, null);
+                reconcile();
             }
             pendingUpdate.updateListener().onResponse(persistedState);
         }
@@ -463,7 +466,7 @@ public abstract class TaskProcessorRuntime<S> {
                     }
                 }
             }
-            reconcile(null, null);
+            reconcile();
         }
     }
 }
