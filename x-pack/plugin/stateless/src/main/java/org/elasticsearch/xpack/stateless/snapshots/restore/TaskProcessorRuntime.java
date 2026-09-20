@@ -165,7 +165,7 @@ public abstract class TaskProcessorRuntime<S> {
             } else {
                 if (claimCompleted) {
                     claimInProgress = false;
-                    nextClaimAtMillis = nowMillis + claimInterval.millis();
+                    nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis + claimInterval.millis());
                 }
                 for (Tuple<S, Lease> claimedTask : claimedTasks) {
                     final Lease lease = claimedTask.v2();

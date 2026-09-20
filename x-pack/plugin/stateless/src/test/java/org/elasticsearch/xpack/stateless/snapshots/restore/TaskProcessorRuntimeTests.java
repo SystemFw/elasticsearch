@@ -190,6 +190,32 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.stopProcessing();
     }
 
+    public void testCapacityFreedDuringClaimIsFilledImmediatelyAfterClaimCompletes() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task-1", "initial");
+        queue.add("task-2", "initial");
+        var executions = new ArrayList<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executions::add, ignored -> {}), 2);
+
+        runtime.startProcessing();
+        deterministicTaskQueue.runAllRunnableTasks();
+
+        queue.deferClaims = true;
+        executions.get(0).update("finished", true, ActionListener.noop());
+        assertThat(queue.claimCount, equalTo(2));
+
+        executions.get(1).update("finished", true, ActionListener.noop());
+        queue.add("task-3", "initial");
+        queue.add("task-4", "initial");
+        queue.completeClaim();
+
+        assertThat(queue.claimCount, equalTo(3));
+
+        queue.completeClaim();
+        runtime.stopProcessing();
+    }
+
     public void testHangingRenewalLosesLeaseAtLastConfirmedExpiry() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
