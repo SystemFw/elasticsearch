@@ -35,7 +35,10 @@ public interface TaskQueue<S> {
      */
     record Lease(String taskId, String ownerId, long fencingToken, long expiryMillis) {}
 
-    /** Claims up to {@code maxTasks} available tasks for {@code ownerId}, replacing any expired leases. */
+    /**
+     * Claims up to {@code maxTasks} distinct available tasks for {@code ownerId}, replacing any expired leases. Each task must occur at
+     * most once in the response.
+     */
     void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<Tuple<S, Lease>>> listener);
 
     /**

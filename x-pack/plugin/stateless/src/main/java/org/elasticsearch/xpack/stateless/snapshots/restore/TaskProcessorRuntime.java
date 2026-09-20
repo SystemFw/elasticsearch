@@ -125,9 +125,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 if (running && schedulingFailure == null) {
                     for (Tuple<S, Lease> claimedTask : claimedTasks) {
                         final Lease lease = claimedTask.v2();
-                        if (tasks.size() < maxConcurrentTasks
-                            && lease.expiryMillis() > nowMillis
-                            && tasks.stream().noneMatch(task -> task.taskId().equals(lease.taskId()))) {
+                        if (lease.expiryMillis() > nowMillis) {
                             final var task = new ActiveTask(claimedTask.v1(), lease, renewalTime(nowMillis, lease.expiryMillis()));
                             tasks.add(task);
                             toStart.add(task);
