@@ -10,9 +10,12 @@ package org.elasticsearch.xpack.stateless.snapshots.restore;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.util.Result;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.threadpool.Scheduler;
+import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 
@@ -21,9 +24,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
@@ -323,6 +328,28 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
+    public void testSchedulingRejectionStopsProcessing() {
+        var deterministicTaskQueue = new RejectingDeterministicTaskQueue();
+        deterministicTaskQueue.rejectScheduling = true;
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        var processCalled = new AtomicBoolean();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> processCalled.set(true), cancelledTask::set));
+
+        runtime.start();
+
+        assertFalse(processCalled.get());
+        assertNotNull(cancelledTask.get());
+        assertThat(cancelledTask.get().state(), equalTo("initial"));
+        assertThat(queue.releasedLeases.size(), equalTo(1));
+        assertThat(runtime.activeTaskCount(), equalTo(0));
+
+        runtime.stop();
+        assertThat(queue.releasedLeases.size(), equalTo(1));
+        runtime.close();
+    }
+
     private static TaskProcessorRuntime<String> newRuntime(
         DeterministicTaskQueue deterministicTaskQueue,
         TestTaskQueue queue,
@@ -370,6 +397,24 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
                 cancel.accept(task);
             }
         };
+    }
+
+    private static class RejectingDeterministicTaskQueue extends DeterministicTaskQueue {
+
+        private boolean rejectScheduling;
+
+        @Override
+        public ThreadPool getThreadPool() {
+            return new DeterministicThreadPool(Function.identity()) {
+                @Override
+                public Scheduler.ScheduledCancellable schedule(Runnable command, TimeValue delay, Executor executor) {
+                    if (rejectScheduling) {
+                        throw new EsRejectedExecutionException("simulated scheduler shutdown", true);
+                    }
+                    return super.schedule(command, delay, executor);
+                }
+            };
+        }
     }
 
     private static class TestTaskQueue implements TaskQueue<String> {

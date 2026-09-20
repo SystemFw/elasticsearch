@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.stateless.snapshots.restore;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
 import org.elasticsearch.common.util.Result;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.logging.LogManager;
@@ -87,13 +88,17 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     @Override
     protected void doStart() {
         running = true;
-        reconcile(null, null, null);
+        reconcile(null, null);
     }
 
     @Override
     protected void doStop() {
+        stopProcessing();
+    }
+
+    private void stopProcessing() {
         running = false;
-        reconcile(null, null, null);
+        reconcile(null, null);
     }
 
     @Override
@@ -102,11 +107,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     /**
      * Reconciles all runtime-owned state under one short critical section. Queue, processor and scheduler calls are dispatched afterwards.
      */
-    private void reconcile(
-        List<Tuple<S, Lease>> claimedTasks,
-        List<Tuple<ActiveTask, Result<Lease, Exception>>> renewals,
-        Exception schedulingFailure
-    ) {
+    private void reconcile(List<Tuple<S, Lease>> claimedTasks, List<Tuple<ActiveTask, Result<Lease, Exception>>> renewals) {
         final List<Tuple<ActiveTask, Lease>> toRenew = new ArrayList<>();
         final List<Tuple<ActiveTask, Exception>> toCancel = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
@@ -122,7 +123,23 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
             if (claimedTasks != null) {
                 claimInProgress = false;
-                if (running && schedulingFailure == null) {
+            }
+
+            if (running == false) {
+                if (claimedTasks != null) {
+                    claimedTasks.forEach(task -> toRelease.add(task.v2()));
+                }
+                for (ActiveTask task : tasks) {
+                    toCancel.add(
+                        new Tuple<>(task, new IllegalStateException("runtime stopped while processing task [" + task.taskId() + "]"))
+                    );
+                    toRelease.add(task.lease);
+                }
+                tasks.clear();
+                nextClaimAtMillis = Long.MAX_VALUE;
+                wakeAtMillis = Long.MAX_VALUE;
+            } else {
+                if (claimedTasks != null) {
                     for (Tuple<S, Lease> claimedTask : claimedTasks) {
                         final Lease lease = claimedTask.v2();
                         if (lease.expiryMillis() > nowMillis) {
@@ -134,33 +151,14 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                         }
                     }
                     nextClaimAtMillis = nowMillis + claimInterval.millis();
-                } else {
-                    claimedTasks.forEach(task -> toRelease.add(task.v2()));
-                }
-            }
-
-            if (renewals != null && running && schedulingFailure == null) {
-                for (Tuple<ActiveTask, Result<Lease, Exception>> renewal : renewals) {
-                    if (renewal.v1().renewalInProgress && renewal.v1().renewalResult == null) {
-                        renewal.v1().renewalResult = renewal.v2();
+                } else if (renewals != null) {
+                    for (Tuple<ActiveTask, Result<Lease, Exception>> renewal : renewals) {
+                        if (renewal.v1().renewalInProgress && renewal.v1().renewalResult == null) {
+                            renewal.v1().renewalResult = renewal.v2();
+                        }
                     }
                 }
-            }
 
-            if (running == false || schedulingFailure != null) {
-                for (ActiveTask task : tasks) {
-                    final Exception failure = schedulingFailure == null
-                        ? new IllegalStateException("runtime stopped while processing task [" + task.taskId() + "]")
-                        : new IllegalStateException("could not schedule task queue maintenance", schedulingFailure);
-                    toCancel.add(new Tuple<>(task, failure));
-                    if (schedulingFailure == null) {
-                        toRelease.add(task.lease);
-                    }
-                }
-                tasks.clear();
-                nextClaimAtMillis = Long.MAX_VALUE;
-                wakeAtMillis = Long.MAX_VALUE;
-            } else {
                 boolean renewalDue = false;
                 for (int i = tasks.size() - 1; i >= 0; i--) {
                     final ActiveTask task = tasks.get(i);
@@ -257,12 +255,12 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     }
 
     private void claimsCompleted(List<Tuple<S, Lease>> claimedTasks) {
-        reconcile(claimedTasks, null, null);
+        reconcile(claimedTasks, null);
     }
 
     private void claimFailed(Exception failure) {
         logger.debug("failed to claim queued tasks", failure);
-        reconcile(List.of(), null, null);
+        reconcile(List.of(), null);
     }
 
     private void renew(List<Tuple<ActiveTask, Lease>> renewals) {
@@ -283,7 +281,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         for (int i = 0; i < renewals.size(); i++) {
             completedRenewals.add(new Tuple<>(renewals.get(i).v1(), results.get(i)));
         }
-        reconcile(null, completedRenewals, null);
+        reconcile(null, completedRenewals);
     }
 
     private void renewalsFailed(List<Tuple<ActiveTask, Lease>> renewals, Exception failure) {
@@ -291,7 +289,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         for (Tuple<ActiveTask, Lease> renewal : renewals) {
             failedRenewals.add(new Tuple<>(renewal.v1(), Result.failure(failure)));
         }
-        reconcile(null, failedRenewals, null);
+        reconcile(null, failedRenewals);
     }
 
     private void startExecution(ActiveTask task) {
@@ -317,9 +315,10 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     private void scheduleWake(long atMillis) {
         final long delayMillis = Math.max(1L, atMillis - threadPool.absoluteTimeInMillis());
         try {
-            threadPool.schedule(() -> reconcile(null, null, null), TimeValue.timeValueMillis(delayMillis), threadPool.generic());
-        } catch (Exception e) {
-            reconcile(null, null, e);
+            threadPool.schedule(() -> reconcile(null, null), TimeValue.timeValueMillis(delayMillis), threadPool.generic());
+        } catch (EsRejectedExecutionException e) {
+            logger.debug("stopping task processor runtime because task queue maintenance was rejected", e);
+            stopProcessing();
         }
     }
 
@@ -430,7 +429,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             }
 
             if (completed.closed()) {
-                reconcile(null, null, null);
+                reconcile(null, null);
             }
             pendingUpdate.updateListener().onResponse(persistedState);
         }
@@ -446,7 +445,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
         private void cancel(Exception failure) {
             closeAndCancel(this, failure);
-            reconcile(null, null, null);
+            reconcile(null, null);
         }
 
         private LocalState<S> close() {
