@@ -103,7 +103,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
     /**
      * Reconciles all runtime-owned state under one short critical section. Queue, processor and scheduler calls are dispatched afterwards.
      */
-    private void reconcile(List<Tuple<S, Lease>> claimedTasks, RenewalBatch renewalBatch, Exception schedulingFailure) {
+    private void reconcile(List<Tuple<S, Lease>> claimedTasks, List<Renewal> renewals, Exception schedulingFailure) {
         final List<Tuple<ActiveTask, Lease>> toRenew = new ArrayList<>();
         final List<Tuple<ActiveTask, Exception>> toCancel = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
@@ -138,12 +138,10 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 }
             }
 
-            if (renewalBatch != null && running && schedulingFailure == null) {
-                for (int i = 0; i < renewalBatch.renewals.size(); i++) {
-                    final Tuple<ActiveTask, Lease> renewal = renewalBatch.renewals.get(i);
-                    final ActiveTask task = renewal.v1();
-                    if (task.lease == renewal.v2() && task.renewalInProgress && task.renewalResult == null) {
-                        task.renewalResult = renewalBatch.results.get(i);
+            if (renewals != null && running && schedulingFailure == null) {
+                for (Renewal renewal : renewals) {
+                    if (renewal.task.lease == renewal.lease && renewal.task.renewalInProgress && renewal.task.renewalResult == null) {
+                        renewal.task.renewalResult = renewal.result;
                     }
                 }
             }
@@ -306,15 +304,19 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             return;
         }
 
-        reconcile(null, new RenewalBatch(renewals, results), null);
+        final List<Renewal> completedRenewals = new ArrayList<>(renewals.size());
+        for (int i = 0; i < renewals.size(); i++) {
+            completedRenewals.add(new Renewal(renewals.get(i).v1(), renewals.get(i).v2(), results.get(i)));
+        }
+        reconcile(null, completedRenewals, null);
     }
 
     private void renewalsFailed(List<Tuple<ActiveTask, Lease>> renewals, Exception failure) {
-        reconcile(
-            null,
-            new RenewalBatch(renewals, renewals.stream().map(ignored -> Result.<Long, Exception>failure(failure)).toList()),
-            null
-        );
+        final List<Renewal> failedRenewals = new ArrayList<>(renewals.size());
+        for (Tuple<ActiveTask, Lease> renewal : renewals) {
+            failedRenewals.add(new Renewal(renewal.v1(), renewal.v2(), Result.failure(failure)));
+        }
+        reconcile(null, failedRenewals, null);
     }
 
     private void startExecution(ActiveTask task) {
@@ -381,14 +383,16 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         return taskCount;
     }
 
-    private final class RenewalBatch {
+    private final class Renewal {
 
-        private final List<Tuple<ActiveTask, Lease>> renewals;
-        private final List<Result<Long, Exception>> results;
+        private final ActiveTask task;
+        private final Lease lease;
+        private final Result<Long, Exception> result;
 
-        private RenewalBatch(List<Tuple<ActiveTask, Lease>> renewals, List<Result<Long, Exception>> results) {
-            this.renewals = renewals;
-            this.results = results;
+        private Renewal(ActiveTask task, Lease lease, Result<Long, Exception> result) {
+            this.task = task;
+            this.lease = lease;
+            this.result = result;
         }
     }
 
