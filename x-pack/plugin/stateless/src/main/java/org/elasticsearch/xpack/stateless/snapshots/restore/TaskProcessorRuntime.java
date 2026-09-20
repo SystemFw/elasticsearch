@@ -8,7 +8,8 @@
 package org.elasticsearch.xpack.stateless.snapshots.restore;
 
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.component.LifecycleListener;
 import org.elasticsearch.common.util.Result;
 import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.core.TimeValue;
@@ -26,9 +27,10 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Runs a processor against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management.
+ * Runs a processor against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management. Instances
+ * must be constructed before the supplied {@link ClusterService} is started.
  */
-public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
+public final class TaskProcessorRuntime<S> {
 
     private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
 
@@ -54,6 +56,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
 
     /** Creates a runtime for one task type and processor. */
     public TaskProcessorRuntime(
+        ClusterService clusterService,
         TaskQueue<S> queue,
         Task<S> processor,
         ThreadPool threadPool,
@@ -63,6 +66,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         TimeValue leaseDuration,
         TimeValue claimInterval
     ) {
+        Objects.requireNonNull(clusterService);
         this.queue = Objects.requireNonNull(queue);
         this.processor = Objects.requireNonNull(processor);
         this.threadPool = Objects.requireNonNull(threadPool);
@@ -83,26 +87,30 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         this.leaseDuration = leaseDuration;
         this.claimInterval = claimInterval;
         this.renewalBatchWindowMillis = Math.min(claimInterval.millis(), Math.max(1L, leaseDuration.millis() / 10L));
+        clusterService.addLifecycleListener(new LifecycleListener() {
+            @Override
+            public void afterStart() {
+                startProcessing();
+            }
+
+            @Override
+            public void beforeStop() {
+                stopProcessing();
+            }
+        });
     }
 
-    @Override
-    protected void doStart() {
+    // Exposed for tests that exercise the runtime independently of ClusterService.
+    void startProcessing() {
         running = true;
         reconcile(null, null);
     }
 
-    @Override
-    protected void doStop() {
-        stopProcessing();
-    }
-
-    private void stopProcessing() {
+    // Exposed for tests that exercise the runtime independently of ClusterService.
+    void stopProcessing() {
         running = false;
         reconcile(null, null);
     }
-
-    @Override
-    protected void doClose() {}
 
     /**
      * Reconciles all runtime-owned state under one short critical section. Queue, processor and scheduler calls are dispatched afterwards.
