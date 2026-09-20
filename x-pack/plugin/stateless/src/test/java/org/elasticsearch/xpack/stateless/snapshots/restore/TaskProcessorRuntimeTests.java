@@ -392,18 +392,25 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void renew(Lease lease, TimeValue leaseDuration, ActionListener<Long> listener) {
+        public void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener) {
             singleRenewCount++;
             renewedLeases.add(lease);
             if (failRenewalsWithLeaseLoss) {
                 listener.onFailure(new LeaseLostException("simulated fencing"));
             } else if (completeRenewals) {
-                listener.onResponse(deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis());
+                listener.onResponse(
+                    new Lease(
+                        lease.taskId(),
+                        lease.ownerId(),
+                        lease.fencingToken(),
+                        deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
+                    )
+                );
             }
         }
 
         @Override
-        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Long, Exception>>> listener) {
+        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener) {
             bulkRenewCount++;
             renewedLeases.addAll(leases);
             if (completeRenewals) {
@@ -411,8 +418,15 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
                     leases.stream()
                         .map(
                             lease -> failRenewalsWithLeaseLoss || lease.taskId().equals(leaseLostOnRenewalTaskId)
-                                ? Result.<Long, Exception>failure(new LeaseLostException("simulated fencing"))
-                                : Result.<Long, Exception>of(deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis())
+                                ? Result.<Lease, Exception>failure(new LeaseLostException("simulated fencing"))
+                                : Result.<Lease, Exception>of(
+                                    new Lease(
+                                        lease.taskId(),
+                                        lease.ownerId(),
+                                        lease.fencingToken(),
+                                        deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
+                                    )
+                                )
                         )
                         .toList()
                 );

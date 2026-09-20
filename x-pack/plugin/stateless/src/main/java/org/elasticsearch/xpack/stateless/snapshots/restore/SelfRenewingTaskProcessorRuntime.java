@@ -378,11 +378,8 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 return;
             }
 
-            final ActionListener<Long> listener = ActionListener.assertOnce(
-                ActionListener.wrap(
-                    renewedExpiryMillis -> leaseRenewed(lease, renewedExpiryMillis),
-                    failure -> leaseRenewalFailed(lease, failure)
-                )
+            final ActionListener<Lease> listener = ActionListener.assertOnce(
+                ActionListener.wrap(renewedLease -> leaseRenewed(lease, renewedLease), failure -> leaseRenewalFailed(lease, failure))
             );
             try {
                 queue.renew(lease, leaseDuration, listener);
@@ -391,21 +388,15 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             }
         }
 
-        private void leaseRenewed(Lease previousLease, long renewedExpiryMillis) {
+        private void leaseRenewed(Lease previousLease, Lease renewedLease) {
             final long nowMillis = threadPool.absoluteTimeInMillis();
-            if (renewedExpiryMillis <= nowMillis) {
+            if (renewedLease.expiryMillis() <= nowMillis) {
                 closeAndCancel(
                     state -> state.lease() == previousLease && state.renewalInProgress(),
                     new LeaseLostException("queue returned an invalid renewed lease for task [" + taskId + "]")
                 );
                 return;
             }
-            final Lease renewedLease = new Lease(
-                previousLease.taskId(),
-                previousLease.ownerId(),
-                previousLease.fencingToken(),
-                renewedExpiryMillis
-            );
 
             final TaskState<S> previous = taskState.getAndUpdate(current -> {
                 if (current.closed() || current.lease() != previousLease || current.renewalInProgress() == false) {
