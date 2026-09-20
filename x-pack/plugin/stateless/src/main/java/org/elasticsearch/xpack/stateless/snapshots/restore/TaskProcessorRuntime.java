@@ -269,19 +269,18 @@ public abstract class TaskProcessorRuntime<S> {
     }
 
     private void claim(int capacity) {
-        final ActionListener<List<Tuple<S, Lease>>> listener = ActionListener.assertOnce(
-            ActionListener.wrap(this::claimsCompleted, this::claimFailed)
-        );
-        queue.claim(workerId, capacity, leaseDuration, listener);
-    }
+        queue.claim(workerId, capacity, leaseDuration, new ActionListener<>() {
+            @Override
+            public void onResponse(List<Tuple<S, Lease>> claimedTasks) {
+                reconcile(true, claimedTasks, List.of());
+            }
 
-    private void claimsCompleted(List<Tuple<S, Lease>> claimedTasks) {
-        reconcile(true, claimedTasks, List.of());
-    }
-
-    private void claimFailed(Exception failure) {
-        logger.debug("failed to claim queued tasks", failure);
-        reconcile(true, List.of(), List.of());
+            @Override
+            public void onFailure(Exception failure) {
+                logger.debug("failed to claim queued tasks", failure);
+                reconcile(true, List.of(), List.of());
+            }
+        });
     }
 
     private void renew(List<Tuple<ActiveTask, Lease>> renewals) {
