@@ -20,8 +20,10 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
@@ -104,7 +106,7 @@ public abstract class TaskProcessorRuntime<S> {
     private final long renewalBatchWindowMillis;
 
     private final Object mutex = new Object();
-    private final List<ActiveTask> tasks = new ArrayList<>();
+    private final Map<String, ActiveTask> tasks = new HashMap<>();
     private volatile boolean running;
     private boolean claimInProgress;
     private long nextClaimAtMillis;
@@ -124,7 +126,7 @@ public abstract class TaskProcessorRuntime<S> {
     }
 
     private void reconcile() {
-        reconcile(false, List.of(), List.of(), List.of());
+        reconcile(false, List.of(), Map.of());
     }
 
     /**
@@ -133,10 +135,9 @@ public abstract class TaskProcessorRuntime<S> {
     private void reconcile(
         boolean claimCompleted,
         List<Tuple<S, Lease>> claimedTasks,
-        List<ActiveTask> renewedTasks,
-        List<Result<Lease, Exception>> renewalResults
+        Map<Lease, Result<Lease, Exception>> renewalResults
     ) {
-        final List<ActiveTask> toRenew = new ArrayList<>();
+        final List<Lease> toRenew = new ArrayList<>();
         final List<Tuple<ActiveTask, Exception>> toCancel = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
         final List<ActiveTask> toStart = new ArrayList<>();
@@ -151,7 +152,7 @@ public abstract class TaskProcessorRuntime<S> {
 
             if (running == false) {
                 claimedTasks.forEach(task -> toRelease.add(task.v2()));
-                for (ActiveTask task : tasks) {
+                for (ActiveTask task : tasks.values()) {
                     toCancel.add(
                         new Tuple<>(task, new IllegalStateException("runtime stopped while processing task [" + task.taskId() + "]"))
                     );
@@ -169,47 +170,44 @@ public abstract class TaskProcessorRuntime<S> {
                     final Lease lease = claimedTask.v2();
                     if (lease.expiryMillis() > nowMillis) {
                         final var task = new ActiveTask(claimedTask.v1(), lease, renewalTime(nowMillis, lease.expiryMillis()));
-                        tasks.add(task);
+                        tasks.put(lease.taskId(), task);
                         toStart.add(task);
                     } else {
                         toRelease.add(lease);
                     }
                 }
 
-                // Bulk renewal results correspond positionally to the requested tasks.
-                for (int i = 0; i < renewedTasks.size(); i++) {
-                    final ActiveTask task = renewedTasks.get(i);
-                    if (task.renewalInProgress && task.renewalResult == null) {
-                        task.renewalResult = renewalResults.get(i);
+                for (Map.Entry<Lease, Result<Lease, Exception>> renewal : renewalResults.entrySet()) {
+                    final Lease requestedLease = renewal.getKey();
+                    final ActiveTask task = tasks.get(requestedLease.taskId());
+                    if (task == null || task.lease.equals(requestedLease) == false || task.renewalInProgress == false) {
+                        continue;
+                    }
+                    final Result<Lease, Exception> result = renewal.getValue();
+                    if (result.isSuccessful()) {
+                        final Lease renewedLease = result.asOptional().orElseThrow();
+                        task.lease = renewedLease;
+                        task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
+                        task.renewalInProgress = false;
+                    } else {
+                        tasks.remove(requestedLease.taskId());
+                        nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
+                        toCancel.add(new Tuple<>(task, result.failure().orElseThrow()));
                     }
                 }
 
                 boolean renewalDue = false;
-                for (int i = tasks.size() - 1; i >= 0; i--) {
-                    final ActiveTask task = tasks.get(i);
+                final Iterator<ActiveTask> taskIterator = tasks.values().iterator();
+                while (taskIterator.hasNext()) {
+                    final ActiveTask task = taskIterator.next();
                     if (task.isClosed()) {
-                        tasks.remove(i);
+                        taskIterator.remove();
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
                         continue;
                     }
 
-                    if (task.renewalResult != null) {
-                        if (task.renewalResult.isSuccessful()) {
-                            final Lease renewedLease = task.renewalResult.asOptional().orElseThrow();
-                            task.lease = renewedLease;
-                            task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
-                            task.renewalInProgress = false;
-                            task.renewalResult = null;
-                        } else {
-                            tasks.remove(i);
-                            nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
-                            toCancel.add(new Tuple<>(task, task.renewalResult.failure().orElseThrow()));
-                            continue;
-                        }
-                    }
-
                     if (nowMillis >= task.lease.expiryMillis()) {
-                        tasks.remove(i);
+                        taskIterator.remove();
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
                         toCancel.add(new Tuple<>(task, new IllegalStateException("lease for task [" + task.taskId() + "] has expired")));
                     } else if (task.renewalInProgress == false && nowMillis >= task.renewAtMillis) {
@@ -219,10 +217,10 @@ public abstract class TaskProcessorRuntime<S> {
 
                 if (renewalDue) {
                     final long renewalCutoffMillis = nowMillis + renewalBatchWindowMillis;
-                    for (ActiveTask task : tasks) {
+                    for (ActiveTask task : tasks.values()) {
                         if (task.renewalInProgress == false && task.renewAtMillis <= renewalCutoffMillis) {
                             task.renewalInProgress = true;
-                            toRenew.add(task);
+                            toRenew.add(task.lease);
                         }
                     }
                 }
@@ -235,7 +233,7 @@ public abstract class TaskProcessorRuntime<S> {
                 }
 
                 long nextWakeAtMillis = capacity > 0 && claimInProgress == false ? nextClaimAtMillis : Long.MAX_VALUE;
-                for (ActiveTask task : tasks) {
+                for (ActiveTask task : tasks.values()) {
                     nextWakeAtMillis = Math.min(
                         nextWakeAtMillis,
                         task.renewalInProgress ? task.lease.expiryMillis() : Math.min(task.renewAtMillis, task.lease.expiryMillis())
@@ -269,28 +267,31 @@ public abstract class TaskProcessorRuntime<S> {
         queue.claim(workerId, capacity, leaseDuration, new ActionListener<>() {
             @Override
             public void onResponse(List<Tuple<S, Lease>> claimedTasks) {
-                reconcile(true, claimedTasks, List.of(), List.of());
+                reconcile(true, claimedTasks, Map.of());
             }
 
             @Override
             public void onFailure(Exception failure) {
                 logger.debug("failed to claim queued tasks", failure);
-                reconcile(true, List.of(), List.of(), List.of());
+                reconcile(true, List.of(), Map.of());
             }
         });
     }
 
-    private void renew(List<ActiveTask> tasksToRenew) {
-        final List<Lease> leases = tasksToRenew.stream().map(task -> task.lease).toList();
+    private void renew(List<Lease> leases) {
         queue.renew(leases, leaseDuration, new ActionListener<>() {
             @Override
-            public void onResponse(List<Result<Lease, Exception>> results) {
-                reconcile(false, List.of(), tasksToRenew, results);
+            public void onResponse(Map<Lease, Result<Lease, Exception>> results) {
+                reconcile(false, List.of(), results);
             }
 
             @Override
             public void onFailure(Exception failure) {
-                reconcile(false, List.of(), tasksToRenew, Collections.nCopies(tasksToRenew.size(), Result.failure(failure)));
+                final Map<Lease, Result<Lease, Exception>> results = HashMap.newHashMap(leases.size());
+                for (Lease lease : leases) {
+                    results.put(lease, Result.failure(failure));
+                }
+                reconcile(false, List.of(), results);
             }
         });
     }
@@ -354,7 +355,6 @@ public abstract class TaskProcessorRuntime<S> {
         // Accessed only by reconciliation under mutex.
         private long renewAtMillis;
         private boolean renewalInProgress;
-        private Result<Lease, Exception> renewalResult;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
             this.taskId = lease.taskId();

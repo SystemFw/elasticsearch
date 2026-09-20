@@ -495,26 +495,31 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener) {
+        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<Map<Lease, Result<Lease, Exception>>> listener) {
             bulkRenewCount++;
             renewedLeases.addAll(leases);
             if (failRenewals) {
-                listener.onResponse(leases.stream().map(ignored -> Result.<Lease, Exception>failure(renewalFailure)).toList());
+                final Map<Lease, Result<Lease, Exception>> results = HashMap.newHashMap(leases.size());
+                for (Lease lease : leases) {
+                    results.put(lease, Result.failure(renewalFailure));
+                }
+                listener.onResponse(results);
             } else if (completeRenewals) {
-                listener.onResponse(
-                    leases.stream()
-                        .map(
-                            lease -> Result.<Lease, Exception>of(
-                                new Lease(
-                                    lease.taskId(),
-                                    lease.ownerId(),
-                                    lease.fencingToken(),
-                                    deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
-                                )
+                final Map<Lease, Result<Lease, Exception>> results = HashMap.newHashMap(leases.size());
+                for (Lease lease : leases) {
+                    results.put(
+                        lease,
+                        Result.of(
+                            new Lease(
+                                lease.taskId(),
+                                lease.ownerId(),
+                                lease.fencingToken(),
+                                deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
                             )
                         )
-                        .toList()
-                );
+                    );
+                }
+                listener.onResponse(results);
             }
         }
 

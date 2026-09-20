@@ -214,6 +214,36 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         runtime.stopProcessing();
     }
 
+    public void testLateRenewalDoesNotAffectNewLeaseIncarnation() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        queue.completeRenewals = false;
+        var executions = new ArrayList<TaskHandle<String>>();
+        var cancellations = new ArrayList<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executions::add, cancellations::add));
+
+        runtime.startProcessing();
+        deterministicTaskQueue.runAllRunnableTasks();
+
+        deterministicTaskQueue.advanceTime();
+        deterministicTaskQueue.runAllRunnableTasks();
+
+        queue.add("task", "reclaimed");
+        deterministicTaskQueue.advanceTime();
+        deterministicTaskQueue.runAllRunnableTasks();
+
+        assertThat(executions.size(), equalTo(2));
+        assertThat(cancellations, equalTo(List.of(executions.get(0))));
+
+        queue.completeBulkRenewal();
+
+        assertThat(runtime.activeTaskCount(), equalTo(1));
+        assertThat(cancellations, equalTo(List.of(executions.get(0))));
+
+        runtime.stopProcessing();
+    }
+
     public void testRenewalFailureCancelsTask() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
@@ -503,6 +533,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private ActionListener<List<Tuple<String, Lease>>> pendingClaim;
         private PendingModification pendingModification;
         private PendingModification pendingFinish;
+        private PendingRenewal pendingRenewal;
 
         private TestTaskQueue(DeterministicTaskQueue deterministicTaskQueue) {
             this.deterministicTaskQueue = deterministicTaskQueue;
@@ -564,27 +595,41 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener) {
+        public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<Map<Lease, Result<Lease, Exception>>> listener) {
             bulkRenewCount++;
             renewedLeases.addAll(leases);
             if (completeRenewals) {
-                listener.onResponse(
-                    leases.stream()
-                        .map(
-                            lease -> failRenewals || lease.taskId().equals(renewalFailureTaskId)
-                                ? Result.<Lease, Exception>failure(renewalFailure)
-                                : Result.<Lease, Exception>of(
-                                    new Lease(
-                                        lease.taskId(),
-                                        lease.ownerId(),
-                                        lease.fencingToken(),
-                                        deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
-                                    )
-                                )
+                listener.onResponse(renewalResults(leases, leaseDuration));
+            } else {
+                assertNull(pendingRenewal);
+                pendingRenewal = new PendingRenewal(leases, leaseDuration, listener);
+            }
+        }
+
+        private void completeBulkRenewal() {
+            final PendingRenewal renewal = pendingRenewal;
+            pendingRenewal = null;
+            renewal.listener.onResponse(renewalResults(renewal.leases, renewal.leaseDuration));
+        }
+
+        private Map<Lease, Result<Lease, Exception>> renewalResults(List<Lease> leases, TimeValue leaseDuration) {
+            final Map<Lease, Result<Lease, Exception>> results = HashMap.newHashMap(leases.size());
+            for (Lease lease : leases) {
+                results.put(
+                    lease,
+                    failRenewals || lease.taskId().equals(renewalFailureTaskId)
+                        ? Result.failure(renewalFailure)
+                        : Result.of(
+                            new Lease(
+                                lease.taskId(),
+                                lease.ownerId(),
+                                lease.fencingToken(),
+                                deterministicTaskQueue.getCurrentTimeMillis() + leaseDuration.millis()
+                            )
                         )
-                        .toList()
                 );
             }
+            return results;
         }
 
         @Override
@@ -629,5 +674,11 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         }
 
         private record PendingModification(String taskId, String state, ActionListener<String> listener) {}
+
+        private record PendingRenewal(
+            List<Lease> leases,
+            TimeValue leaseDuration,
+            ActionListener<Map<Lease, Result<Lease, Exception>>> listener
+        ) {}
     }
 }

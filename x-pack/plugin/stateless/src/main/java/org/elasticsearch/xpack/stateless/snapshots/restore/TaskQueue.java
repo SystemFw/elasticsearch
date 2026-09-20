@@ -13,6 +13,7 @@ import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Durable queue operations needed by {@link TaskProcessorRuntime}. A nonterminal task is available to claim when it has no lease or its
@@ -48,13 +49,13 @@ public interface TaskQueue<S> {
     void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener);
 
     /**
-     * Renews live leases in bulk. The response must contain one result per input lease, in the same order. A request-level failure is
-     * reported to {@code listener}; failures affecting individual leases are returned as item results. The queue owns any retries for
-     * transient failures and callers treat reported failures as final. Internal retries must not hold successful item results until their
-     * previously known leases expire: unresolved items must be returned as failures early enough for the caller to process successful
-     * renewals before the earliest input lease expires.
+     * Renews live leases in bulk. The response must contain one result keyed by each input lease. A request-level failure is reported to
+     * {@code listener}; failures affecting individual leases are returned as item results. The queue owns any retries for transient
+     * failures and callers treat reported failures as final. Internal retries must not hold successful item results until their previously
+     * known leases expire: unresolved items must be returned as failures early enough for the caller to process successful renewals before
+     * the earliest input lease expires.
      */
-    void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener);
+    void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<Map<Lease, Result<Lease, Exception>>> listener);
 
     /**
      * Replaces the task-specific persistent state, optionally making the task terminal and removing its lease. The queue owns any retries
