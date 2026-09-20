@@ -559,8 +559,8 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void release(Lease lease, ActionListener<Void> listener) {
-            releasedLeases.add(lease);
+        public void release(List<Lease> leases, ActionListener<Void> listener) {
+            releasedLeases.addAll(leases);
             listener.onResponse(null);
         }
 

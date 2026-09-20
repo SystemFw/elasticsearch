@@ -48,7 +48,7 @@ public abstract class TaskProcessorRuntime<S> {
     /** Starts processing a claimed task. */
     protected abstract void process(TaskHandle<S> task) throws Exception;
 
-    /** Stops processing a task whose lease is no longer owned by this runtime. */
+    /** Quickly signals processing to stop for a task whose lease is no longer owned by this runtime. This method must not block. */
     protected abstract void cancel(TaskHandle<S> task);
 
     /** Creates a runtime for one task type. */
@@ -247,7 +247,9 @@ public abstract class TaskProcessorRuntime<S> {
         for (Tuple<ActiveTask, Exception> cancellation : toCancel) {
             cancellation.v1().cancel(cancellation.v2());
         }
-        toRelease.forEach(this::release);
+        if (toRelease.isEmpty() == false) {
+            release(toRelease);
+        }
         if (toRenew.isEmpty() == false) {
             renew(toRenew);
         }
@@ -323,12 +325,12 @@ public abstract class TaskProcessorRuntime<S> {
         }
     }
 
-    private void release(Lease lease) {
+    private void release(List<Lease> leases) {
         final ActionListener<Void> listener = ActionListener.wrap(
             ignored -> {},
-            failure -> logger.debug(() -> "failed to release lease for task [" + lease.taskId() + "]", failure)
+            failure -> logger.debug(() -> "failed to release [" + leases.size() + "] task leases", failure)
         );
-        queue.release(lease, listener);
+        queue.release(leases, listener);
     }
 
     private static long renewalTime(long nowMillis, long expiryMillis) {
@@ -418,20 +420,14 @@ public abstract class TaskProcessorRuntime<S> {
         }
 
         private void stateChangeFailed(Exception failure) {
-            try {
-                cancel(failure);
-            } finally {
-                reconcile();
-            }
+            cancel(failure);
+            reconcile();
         }
 
         private void processorFailed(Exception failure) {
             logger.warn(() -> "task processor failed unexpectedly for task [" + taskId + "]", failure);
-            try {
-                cancel(new IllegalStateException("task processor failed for task [" + taskId + "]", failure));
-            } finally {
-                reconcile();
-            }
+            cancel(new IllegalStateException("task processor failed for task [" + taskId + "]", failure));
+            reconcile();
         }
 
         private void cancel(Exception failure) {
@@ -439,9 +435,17 @@ public abstract class TaskProcessorRuntime<S> {
                 current -> current.closed() ? current : new LocalState<>(current.state(), true, false, null)
             );
             if (previous.closed() == false) {
-                TaskProcessorRuntime.this.cancel(this);
+                try {
+                    TaskProcessorRuntime.this.cancel(this);
+                } catch (Exception e) {
+                    logger.warn(() -> "task processor failed to cancel task [" + taskId + "]", e);
+                }
                 if (previous.updateListener() != null) {
-                    previous.updateListener().onFailure(failure);
+                    try {
+                        previous.updateListener().onFailure(failure);
+                    } catch (Exception e) {
+                        logger.warn(() -> "state-change listener failed while cancelling task [" + taskId + "]", e);
+                    }
                 }
             }
         }

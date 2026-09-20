@@ -64,8 +64,16 @@ public interface TaskQueue<S> {
     void update(Lease lease, S newState, boolean terminal, ActionListener<S> listener);
 
     /**
-     * Voluntarily gives up the lease and makes the task available immediately. This operation must be idempotent for a task that remains
-     * available with the same fencing token.
+     * Voluntarily gives up one lease and makes the task available immediately.
      */
-    void release(Lease lease, ActionListener<Void> listener);
+    default void release(Lease lease, ActionListener<Void> listener) {
+        release(List.of(lease), listener);
+    }
+
+    /**
+     * Voluntarily gives up leases in bulk and makes their tasks available immediately. Each release must be idempotent for a task that
+     * remains available with the same fencing token. The queue owns any retries for transient failures and reports any remaining item
+     * failures through {@code listener}.
+     */
+    void release(List<Lease> leases, ActionListener<Void> listener);
 }

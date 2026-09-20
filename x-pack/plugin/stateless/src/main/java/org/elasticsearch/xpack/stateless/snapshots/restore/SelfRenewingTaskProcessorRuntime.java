@@ -48,7 +48,7 @@ public abstract class SelfRenewingTaskProcessorRuntime<S> {
     /** Starts processing a claimed task. */
     protected abstract void process(TaskHandle<S> task) throws Exception;
 
-    /** Stops processing a task whose lease is no longer owned by this runtime. */
+    /** Quickly signals processing to stop for a task whose lease is no longer owned by this runtime. This method must not block. */
     protected abstract void cancel(TaskHandle<S> task);
 
     /** Creates a runtime for one task type. */

@@ -152,6 +152,8 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         assertThat(queue.bulkRenewCount, equalTo(1));
 
         runtime.stopProcessing();
+        assertThat(queue.releasedLeases.size(), equalTo(2));
+        assertThat(queue.bulkReleaseCount, equalTo(1));
     }
 
     public void testBulkRenewalResultsAreAppliedIndependently() {
@@ -545,6 +547,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         private int claimCount;
         private int singleRenewCount;
         private int bulkRenewCount;
+        private int bulkReleaseCount;
         private long nextFencingToken;
         private boolean deferClaims;
         private boolean deferModifications;
@@ -694,8 +697,9 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         }
 
         @Override
-        public void release(Lease lease, ActionListener<Void> listener) {
-            releasedLeases.add(lease);
+        public void release(List<Lease> leases, ActionListener<Void> listener) {
+            bulkReleaseCount++;
+            releasedLeases.addAll(leases);
             listener.onResponse(null);
         }
 
