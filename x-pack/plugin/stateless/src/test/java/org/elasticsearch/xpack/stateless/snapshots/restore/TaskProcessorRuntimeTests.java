@@ -102,7 +102,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         executionRef.get()
             .update("modified", false, ActionListener.wrap(ignored -> fail("update unexpectedly succeeded"), updateFailure::set));
 
-        assertSame(queue.updateFailure, updateFailure.get());
+        assertThat(updateFailure.get(), instanceOf(InterruptedException.class));
         assertSame(executionRef.get(), cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
         assertThat(queue.releasedLeases.size(), equalTo(1));
@@ -316,7 +316,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
 
-        assertSame(queue.renewalFailure, stateChangeFailure.get());
+        assertThat(stateChangeFailure.get(), instanceOf(InterruptedException.class));
         assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
@@ -341,7 +341,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
 
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
-        assertSame(queue.renewalFailure, finishFailure.get());
+        assertThat(finishFailure.get(), instanceOf(InterruptedException.class));
         assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
@@ -357,9 +357,11 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
-        var runtime = newRuntime(deterministicTaskQueue, queue, processor(ignored -> {
-            throw new RuntimeException("simulated processor failure");
-        }, cancelledTask::set));
+        var runtime = newRuntime(
+            deterministicTaskQueue,
+            queue,
+            processor(ignored -> { throw new RuntimeException("simulated processor failure"); }, cancelledTask::set)
+        );
 
         runtime.startProcessing();
         deterministicTaskQueue.runAllRunnableTasks();

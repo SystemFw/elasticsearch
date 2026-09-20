@@ -144,7 +144,7 @@ public abstract class TaskProcessorRuntime<S> {
         Map<Lease, Result<Lease, Exception>> renewalResults
     ) {
         final List<Lease> toRenew = new ArrayList<>();
-        final List<Tuple<ActiveTask, Exception>> toCancel = new ArrayList<>();
+        final List<ActiveTask> toCancel = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
         final List<ActiveTask> toStart = new ArrayList<>();
         int claimCapacity = 0;
@@ -159,9 +159,7 @@ public abstract class TaskProcessorRuntime<S> {
             if (running == false) {
                 claimedTasks.forEach(task -> toRelease.add(task.v2()));
                 for (ActiveTask task : tasks.values()) {
-                    toCancel.add(
-                        new Tuple<>(task, new IllegalStateException("runtime stopped while processing task [" + task.taskId() + "]"))
-                    );
+                    toCancel.add(task);
                     toRelease.add(task.lease);
                 }
                 tasks.clear();
@@ -179,7 +177,7 @@ public abstract class TaskProcessorRuntime<S> {
                         tasks.put(lease.taskId(), task);
                         toStart.add(task);
                     } else {
-                         toRelease.add(lease);
+                        toRelease.add(lease);
                     }
                 }
 
@@ -195,9 +193,13 @@ public abstract class TaskProcessorRuntime<S> {
                         task.lease = renewedLease;
                         task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
                     } else {
+                        logger.debug(
+                            () -> "failed to renew lease for task [" + requestedLease.taskId() + "]",
+                            result.failure().orElseThrow()
+                        );
                         tasks.remove(requestedLease.taskId());
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
-                        toCancel.add(new Tuple<>(task, result.failure().orElseThrow()));
+                        toCancel.add(task);
                     }
                 }
 
@@ -218,7 +220,7 @@ public abstract class TaskProcessorRuntime<S> {
                     if (nowMillis >= task.lease.expiryMillis()) {
                         taskIterator.remove();
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
-                        toCancel.add(new Tuple<>(task, new IllegalStateException("lease for task [" + task.taskId() + "] has expired")));
+                        toCancel.add(task);
                     } else if (nowMillis >= task.renewAtMillis) {
                         renewalDue = true;
                     }
@@ -253,8 +255,8 @@ public abstract class TaskProcessorRuntime<S> {
             taskCount = tasks.size();
         }
 
-        for (Tuple<ActiveTask, Exception> cancellation : toCancel) {
-            cancellation.v1().cancel(cancellation.v2());
+        for (ActiveTask task : toCancel) {
+            task.cancel();
         }
         if (toRelease.isEmpty() == false) {
             release(toRelease);
@@ -425,17 +427,18 @@ public abstract class TaskProcessorRuntime<S> {
         }
 
         private void stateChangeFailed(Exception failure) {
-            cancel(failure);
+            logger.debug(() -> "state change failed for task [" + taskId + "]", failure);
+            cancel();
             reconcile();
         }
 
         private void processorFailed(Exception failure) {
             logger.warn(() -> "task processor failed unexpectedly for task [" + taskId + "]", failure);
-            cancel(new IllegalStateException("task processor failed for task [" + taskId + "]", failure));
+            cancel();
             reconcile();
         }
 
-        private void cancel(Exception failure) {
+        private void cancel() {
             final LocalState<S> previous = localState.getAndUpdate(
                 current -> current.closed() ? current : new LocalState<>(current.state(), true, false, null)
             );
@@ -447,7 +450,7 @@ public abstract class TaskProcessorRuntime<S> {
                 }
                 if (previous.updateListener() != null) {
                     try {
-                        previous.updateListener().onFailure(failure);
+                        previous.updateListener().onFailure(new InterruptedException());
                     } catch (Exception e) {
                         logger.warn(() -> "state-change listener failed while cancelling task [" + taskId + "]", e);
                     }
