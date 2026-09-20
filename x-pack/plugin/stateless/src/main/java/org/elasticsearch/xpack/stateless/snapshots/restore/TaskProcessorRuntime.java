@@ -20,6 +20,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Executor;
@@ -123,7 +124,7 @@ public abstract class TaskProcessorRuntime<S> {
     }
 
     private void reconcile() {
-        reconcile(false, List.of(), List.of());
+        reconcile(false, List.of(), List.of(), List.of());
     }
 
     /**
@@ -132,9 +133,10 @@ public abstract class TaskProcessorRuntime<S> {
     private void reconcile(
         boolean claimCompleted,
         List<Tuple<S, Lease>> claimedTasks,
-        List<Tuple<ActiveTask, Result<Lease, Exception>>> renewals
+        List<ActiveTask> renewedTasks,
+        List<Result<Lease, Exception>> renewalResults
     ) {
-        final List<Tuple<ActiveTask, Lease>> toRenew = new ArrayList<>();
+        final List<ActiveTask> toRenew = new ArrayList<>();
         final List<Tuple<ActiveTask, Exception>> toCancel = new ArrayList<>();
         final List<Lease> toRelease = new ArrayList<>();
         final List<ActiveTask> toStart = new ArrayList<>();
@@ -174,9 +176,11 @@ public abstract class TaskProcessorRuntime<S> {
                     }
                 }
 
-                for (Tuple<ActiveTask, Result<Lease, Exception>> renewal : renewals) {
-                    if (renewal.v1().renewalInProgress && renewal.v1().renewalResult == null) {
-                        renewal.v1().renewalResult = renewal.v2();
+                // Bulk renewal results correspond positionally to the requested tasks.
+                for (int i = 0; i < renewedTasks.size(); i++) {
+                    final ActiveTask task = renewedTasks.get(i);
+                    if (task.renewalInProgress && task.renewalResult == null) {
+                        task.renewalResult = renewalResults.get(i);
                     }
                 }
 
@@ -190,12 +194,8 @@ public abstract class TaskProcessorRuntime<S> {
                     }
 
                     if (task.renewalResult != null) {
-                        final Lease renewedLease = task.renewalResult.asOptional().orElse(null);
-                        final Exception renewalFailure = task.renewalResult.failure().orElse(null);
-                        final boolean validRenewal = renewalFailure == null
-                            && renewedLease != null
-                            && renewedLease.expiryMillis() > nowMillis;
-                        if (validRenewal) {
+                        if (task.renewalResult.isSuccessful()) {
+                            final Lease renewedLease = task.renewalResult.asOptional().orElseThrow();
                             task.lease = renewedLease;
                             task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
                             task.renewalInProgress = false;
@@ -203,10 +203,7 @@ public abstract class TaskProcessorRuntime<S> {
                         } else {
                             tasks.remove(i);
                             nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
-                            final Exception failure = renewalFailure != null
-                                ? renewalFailure
-                                : new IllegalStateException("queue returned an invalid renewed lease for task [" + task.taskId() + "]");
-                            toCancel.add(new Tuple<>(task, failure));
+                            toCancel.add(new Tuple<>(task, task.renewalResult.failure().orElseThrow()));
                             continue;
                         }
                     }
@@ -225,7 +222,7 @@ public abstract class TaskProcessorRuntime<S> {
                     for (ActiveTask task : tasks) {
                         if (task.renewalInProgress == false && task.renewAtMillis <= renewalCutoffMillis) {
                             task.renewalInProgress = true;
-                            toRenew.add(new Tuple<>(task, task.lease));
+                            toRenew.add(task);
                         }
                     }
                 }
@@ -272,44 +269,30 @@ public abstract class TaskProcessorRuntime<S> {
         queue.claim(workerId, capacity, leaseDuration, new ActionListener<>() {
             @Override
             public void onResponse(List<Tuple<S, Lease>> claimedTasks) {
-                reconcile(true, claimedTasks, List.of());
+                reconcile(true, claimedTasks, List.of(), List.of());
             }
 
             @Override
             public void onFailure(Exception failure) {
                 logger.debug("failed to claim queued tasks", failure);
-                reconcile(true, List.of(), List.of());
+                reconcile(true, List.of(), List.of(), List.of());
             }
         });
     }
 
-    private void renew(List<Tuple<ActiveTask, Lease>> renewals) {
-        final List<Lease> leases = renewals.stream().map(Tuple::v2).toList();
-        final ActionListener<List<Result<Lease, Exception>>> listener = ActionListener.assertOnce(
-            ActionListener.wrap(results -> renewalsCompleted(renewals, results), failure -> renewalsFailed(renewals, failure))
-        );
-        queue.renew(leases, leaseDuration, listener);
-    }
+    private void renew(List<ActiveTask> tasksToRenew) {
+        final List<Lease> leases = tasksToRenew.stream().map(task -> task.lease).toList();
+        queue.renew(leases, leaseDuration, new ActionListener<>() {
+            @Override
+            public void onResponse(List<Result<Lease, Exception>> results) {
+                reconcile(false, List.of(), tasksToRenew, results);
+            }
 
-    private void renewalsCompleted(List<Tuple<ActiveTask, Lease>> renewals, List<Result<Lease, Exception>> results) {
-        if (results == null || results.size() != renewals.size() || results.stream().anyMatch(Objects::isNull)) {
-            renewalsFailed(renewals, new IllegalStateException("queue returned an invalid bulk renewal response"));
-            return;
-        }
-
-        final List<Tuple<ActiveTask, Result<Lease, Exception>>> completedRenewals = new ArrayList<>(renewals.size());
-        for (int i = 0; i < renewals.size(); i++) {
-            completedRenewals.add(new Tuple<>(renewals.get(i).v1(), results.get(i)));
-        }
-        reconcile(false, List.of(), completedRenewals);
-    }
-
-    private void renewalsFailed(List<Tuple<ActiveTask, Lease>> renewals, Exception failure) {
-        final List<Tuple<ActiveTask, Result<Lease, Exception>>> failedRenewals = new ArrayList<>(renewals.size());
-        for (Tuple<ActiveTask, Lease> renewal : renewals) {
-            failedRenewals.add(new Tuple<>(renewal.v1(), Result.failure(failure)));
-        }
-        reconcile(false, List.of(), failedRenewals);
+            @Override
+            public void onFailure(Exception failure) {
+                reconcile(false, List.of(), tasksToRenew, Collections.nCopies(tasksToRenew.size(), Result.failure(failure)));
+            }
+        });
     }
 
     private void startExecution(ActiveTask task) {
