@@ -27,15 +27,15 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Runs a processor against tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management. Instances
- * must be constructed before the supplied {@link ClusterService} is started.
+ * Processes tasks claimed from a {@link TaskQueue}, with bounded concurrency and centralized lease management. Instances must be fully
+ * constructed before the supplied {@link ClusterService} is started, so that lifecycle callbacks cannot reach a partially initialized
+ * subclass.
  */
-public final class TaskProcessorRuntime<S> {
+public abstract class TaskProcessorRuntime<S> {
 
     private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
 
     private final TaskQueue<S> queue;
-    private final Task<S> processor;
     private final ThreadPool threadPool;
     private final Executor processorExecutor;
     private final String workerId;
@@ -54,11 +54,10 @@ public final class TaskProcessorRuntime<S> {
 
     private record LocalState<T>(T state, boolean closed, boolean terminalUpdate, ActionListener<T> updateListener) {}
 
-    /** Creates a runtime for one task type and processor. */
-    public TaskProcessorRuntime(
+    /** Creates a runtime for one task type. */
+    protected TaskProcessorRuntime(
         ClusterService clusterService,
         TaskQueue<S> queue,
-        Task<S> processor,
         ThreadPool threadPool,
         Executor processorExecutor,
         String workerId,
@@ -68,7 +67,6 @@ public final class TaskProcessorRuntime<S> {
     ) {
         Objects.requireNonNull(clusterService);
         this.queue = Objects.requireNonNull(queue);
-        this.processor = Objects.requireNonNull(processor);
         this.threadPool = Objects.requireNonNull(threadPool);
         this.processorExecutor = Objects.requireNonNull(processorExecutor);
         this.workerId = Objects.requireNonNull(workerId);
@@ -99,6 +97,12 @@ public final class TaskProcessorRuntime<S> {
             }
         });
     }
+
+    /** Starts processing a claimed task. */
+    protected abstract void process(TaskHandle<S> task) throws Exception;
+
+    /** Stops processing a task whose lease is no longer owned by this runtime. */
+    protected abstract void cancel(TaskHandle<S> task);
 
     // Exposed for tests that exercise the runtime independently of ClusterService.
     void startProcessing() {
@@ -310,7 +314,7 @@ public final class TaskProcessorRuntime<S> {
                     return;
                 }
                 try {
-                    processor.process(task);
+                    process(task);
                 } catch (Exception e) {
                     task.processorFailed(e);
                 }
@@ -334,7 +338,7 @@ public final class TaskProcessorRuntime<S> {
         final LocalState<S> previous = task.close();
         if (previous != null) {
             try {
-                processor.cancel(task);
+                cancel(task);
             } catch (Exception e) {
                 logger.warn(() -> "task processor failed to cancel task [" + task.taskId() + "]", e);
             }

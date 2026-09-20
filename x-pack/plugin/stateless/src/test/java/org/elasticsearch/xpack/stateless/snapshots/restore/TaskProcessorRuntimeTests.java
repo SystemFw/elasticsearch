@@ -398,7 +398,7 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
         ClusterService clusterService
     ) {
         var threadPool = deterministicTaskQueue.getThreadPool();
-        return new TaskProcessorRuntime<>(
+        return new TestTaskProcessorRuntime(
             clusterService,
             queue,
             processor,
@@ -423,6 +423,36 @@ public class TaskProcessorRuntimeTests extends ESTestCase {
                 cancel.accept(task);
             }
         };
+    }
+
+    private static class TestTaskProcessorRuntime extends TaskProcessorRuntime<String> {
+
+        private final Task<String> processor;
+
+        private TestTaskProcessorRuntime(
+            ClusterService clusterService,
+            TaskQueue<String> queue,
+            Task<String> processor,
+            ThreadPool threadPool,
+            Executor processorExecutor,
+            String workerId,
+            int maxConcurrentTasks,
+            TimeValue leaseDuration,
+            TimeValue claimInterval
+        ) {
+            super(clusterService, queue, threadPool, processorExecutor, workerId, maxConcurrentTasks, leaseDuration, claimInterval);
+            this.processor = processor;
+        }
+
+        @Override
+        protected void process(TaskHandle<String> task) throws Exception {
+            processor.process(task);
+        }
+
+        @Override
+        protected void cancel(TaskHandle<String> task) {
+            processor.cancel(task);
+        }
     }
 
     private static class RejectingDeterministicTaskQueue extends DeterministicTaskQueue {
