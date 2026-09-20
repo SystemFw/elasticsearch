@@ -96,6 +96,7 @@ public abstract class TaskProcessorRuntime<S> {
     }
 
     private static final Logger logger = LogManager.getLogger(TaskProcessorRuntime.class);
+    private static final long RENEWAL_IN_PROGRESS = Long.MAX_VALUE;
     private final TaskQueue<S> queue;
     private final ThreadPool threadPool;
     private final Executor processorExecutor;
@@ -180,7 +181,7 @@ public abstract class TaskProcessorRuntime<S> {
                 for (Map.Entry<Lease, Result<Lease, Exception>> renewal : renewalResults.entrySet()) {
                     final Lease requestedLease = renewal.getKey();
                     final ActiveTask task = tasks.get(requestedLease.taskId());
-                    if (task == null || task.lease.equals(requestedLease) == false || task.renewalInProgress == false) {
+                    if (task == null || task.lease.equals(requestedLease) == false || task.renewAtMillis != RENEWAL_IN_PROGRESS) {
                         continue;
                     }
                     final Result<Lease, Exception> result = renewal.getValue();
@@ -188,7 +189,6 @@ public abstract class TaskProcessorRuntime<S> {
                         final Lease renewedLease = result.asOptional().orElseThrow();
                         task.lease = renewedLease;
                         task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
-                        task.renewalInProgress = false;
                     } else {
                         tasks.remove(requestedLease.taskId());
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
@@ -210,7 +210,7 @@ public abstract class TaskProcessorRuntime<S> {
                         taskIterator.remove();
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
                         toCancel.add(new Tuple<>(task, new IllegalStateException("lease for task [" + task.taskId() + "] has expired")));
-                    } else if (task.renewalInProgress == false && nowMillis >= task.renewAtMillis) {
+                    } else if (nowMillis >= task.renewAtMillis) {
                         renewalDue = true;
                     }
                 }
@@ -218,8 +218,8 @@ public abstract class TaskProcessorRuntime<S> {
                 if (renewalDue) {
                     final long renewalCutoffMillis = nowMillis + renewalBatchWindowMillis;
                     for (ActiveTask task : tasks.values()) {
-                        if (task.renewalInProgress == false && task.renewAtMillis <= renewalCutoffMillis) {
-                            task.renewalInProgress = true;
+                        if (task.renewAtMillis <= renewalCutoffMillis) {
+                            task.renewAtMillis = RENEWAL_IN_PROGRESS;
                             toRenew.add(task.lease);
                         }
                     }
@@ -234,10 +234,7 @@ public abstract class TaskProcessorRuntime<S> {
 
                 long nextWakeAtMillis = capacity > 0 && claimInProgress == false ? nextClaimAtMillis : Long.MAX_VALUE;
                 for (ActiveTask task : tasks.values()) {
-                    nextWakeAtMillis = Math.min(
-                        nextWakeAtMillis,
-                        task.renewalInProgress ? task.lease.expiryMillis() : Math.min(task.renewAtMillis, task.lease.expiryMillis())
-                    );
+                    nextWakeAtMillis = Math.min(nextWakeAtMillis, Math.min(task.renewAtMillis, task.lease.expiryMillis()));
                 }
                 if (nextWakeAtMillis < wakeAtMillis) {
                     wakeAtMillis = nextWakeAtMillis;
@@ -354,7 +351,6 @@ public abstract class TaskProcessorRuntime<S> {
         private volatile Lease lease;
         // Accessed only by reconciliation under mutex.
         private long renewAtMillis;
-        private boolean renewalInProgress;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
             this.taskId = lease.taskId();
