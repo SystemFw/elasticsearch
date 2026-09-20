@@ -17,7 +17,6 @@ import org.elasticsearch.threadpool.Scheduler;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
-import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
 
 import java.util.List;
 import java.util.Objects;
@@ -235,10 +234,6 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 return new TaskState<>(state, renewedLease, closed, false, updateGeneration, terminalUpdate, updateListener, null, null);
             }
 
-            private TaskState<T> renewalRetryPending() {
-                return new TaskState<>(state, lease, closed, false, updateGeneration, terminalUpdate, updateListener, null, expiryTimer);
-            }
-
             private TaskState<T> updateStarted(boolean terminal, ActionListener<T> listener) {
                 return new TaskState<>(
                     state,
@@ -265,10 +260,6 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                     terminalUpdate ? null : renewalTimer,
                     terminalUpdate ? null : expiryTimer
                 );
-            }
-
-            private TaskState<T> updateFailed() {
-                return new TaskState<>(state, lease, closed, renewalInProgress, updateGeneration, false, null, renewalTimer, expiryTimer);
             }
 
             private TaskState<T> close() {
@@ -306,7 +297,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             final long nowMillis = threadPool.absoluteTimeInMillis();
             final long remainingMillis = lease.expiryMillis() - nowMillis;
             if (remainingMillis <= 0L) {
-                closeAndCancel(state -> state.lease() == lease, new LeaseLostException("lease for task [" + taskId + "] has expired"));
+                closeAndCancel(state -> state.lease() == lease, new IllegalStateException("lease for task [" + taskId + "] has expired"));
                 return;
             }
 
@@ -321,7 +312,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 expiryTimer = threadPool.schedule(
                     () -> closeAndCancel(
                         state -> state.lease() == lease,
-                        new LeaseLostException("lease for task [" + taskId + "] has expired")
+                        new IllegalStateException("lease for task [" + taskId + "] has expired")
                     ),
                     TimeValue.timeValueMillis(remainingMillis),
                     threadPool.generic()
@@ -336,7 +327,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 }
                 closeAndCancel(
                     state -> state.lease() == lease,
-                    new LeaseLostException("could not schedule lease management for task [" + taskId + "]", e)
+                    new IllegalStateException("could not schedule lease management for task [" + taskId + "]", e)
                 );
             }
         }
@@ -393,7 +384,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
             if (renewedLease.expiryMillis() <= nowMillis) {
                 closeAndCancel(
                     state -> state.lease() == previousLease && state.renewalInProgress(),
-                    new LeaseLostException("queue returned an invalid renewed lease for task [" + taskId + "]")
+                    new IllegalStateException("queue returned an invalid renewed lease for task [" + taskId + "]")
                 );
                 return;
             }
@@ -412,41 +403,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
         }
 
         private void leaseRenewalFailed(Lease lease, Exception failure) {
-            final long nowMillis = threadPool.absoluteTimeInMillis();
-            if (failure instanceof LeaseLostException || nowMillis >= lease.expiryMillis()) {
-                final Exception leaseFailure = failure instanceof LeaseLostException
-                    ? failure
-                    : new LeaseLostException("lease for task [" + taskId + "] has expired", failure);
-                closeAndCancel(state -> state.lease() == lease && state.renewalInProgress(), leaseFailure);
-                return;
-            }
-
-            final TaskState<S> previous = taskState.getAndUpdate(current -> {
-                if (current.closed() || current.lease() != lease || current.renewalInProgress() == false) {
-                    return current;
-                }
-                return current.renewalRetryPending();
-            });
-            if (previous.closed() || previous.lease() != lease || previous.renewalInProgress() == false) {
-                return;
-            }
-
-            final long normalRetryMillis = Math.max(1L, leaseDuration.millis() / 10L);
-            final long remainingMillis = lease.expiryMillis() - nowMillis;
-            final long retryMillis = Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
-            try {
-                final Scheduler.Cancellable renewalTimer = threadPool.schedule(
-                    () -> startRenewal(lease),
-                    TimeValue.timeValueMillis(retryMillis),
-                    threadPool.generic()
-                );
-                installTimers(lease, renewalTimer, null);
-            } catch (Exception e) {
-                closeAndCancel(
-                    state -> state.lease() == lease,
-                    new LeaseLostException("could not schedule lease renewal for task [" + taskId + "]", e)
-                );
-            }
+            closeAndCancel(state -> state.lease() == lease && state.renewalInProgress(), failure);
         }
 
         @Override
@@ -463,7 +420,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 return current.updateStarted(terminal, listener);
             });
             if (previous.closed()) {
-                listener.onFailure(new LeaseLostException("lease for task [" + taskId + "] is no longer active"));
+                listener.onFailure(new IllegalStateException("lease for task [" + taskId + "] is no longer active"));
                 return;
             }
             if (previous.updateListener() != null) {
@@ -480,7 +437,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 )
             );
             if (threadPool.absoluteTimeInMillis() >= lease.expiryMillis()) {
-                operationListener.onFailure(new LeaseLostException("lease for task [" + taskId + "] has expired"));
+                operationListener.onFailure(new IllegalStateException("lease for task [" + taskId + "] has expired"));
             } else {
                 try {
                     queue.update(lease, newState, terminal, operationListener);
@@ -508,31 +465,18 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
         }
 
         private void stateChangeFailed(long updateGeneration, Exception failure) {
-            if (failure instanceof LeaseLostException) {
-                closeAndCancel(state -> state.updateListener() != null && state.updateGeneration() == updateGeneration, failure);
-                return;
-            }
-
-            final TaskState<S> previous = taskState.getAndUpdate(current -> {
-                if (current.closed() || current.updateListener() == null || current.updateGeneration() != updateGeneration) {
-                    return current;
-                }
-                return current.updateFailed();
-            });
-            if (previous.closed() == false && previous.updateListener() != null && previous.updateGeneration() == updateGeneration) {
-                previous.updateListener().onFailure(failure);
-            }
+            closeAndCancel(state -> state.updateListener() != null && state.updateGeneration() == updateGeneration, failure);
         }
 
         private void processorFailed(Exception failure) {
             logger.warn(() -> "task processor failed unexpectedly for task [" + taskId + "]", failure);
-            closeAndCancel(state -> true, new LeaseLostException("task processor failed for task [" + taskId + "]", failure));
+            closeAndCancel(state -> true, new IllegalStateException("task processor failed for task [" + taskId + "]", failure));
         }
 
         private void stopAndRelease() {
             final TaskState<S> previous = closeAndCancel(
                 state -> true,
-                new LeaseLostException("runtime stopped while processing task [" + taskId + "]")
+                new IllegalStateException("runtime stopped while processing task [" + taskId + "]")
             );
             if (previous != null) {
                 release(previous.lease());
@@ -557,7 +501,7 @@ public final class SelfRenewingTaskProcessorRuntime<S> extends AbstractLifecycle
                 try {
                     previous.updateListener().onFailure(failure);
                 } catch (Exception e) {
-                    logger.warn(() -> "state-change listener failed while handling lease loss for task [" + taskId + "]", e);
+                    logger.warn(() -> "state-change listener failed while cancelling task [" + taskId + "]", e);
                 }
             }
             return previous;

@@ -17,7 +17,6 @@ import org.elasticsearch.logging.Logger;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
-import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -153,8 +152,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             if (running == false || schedulingFailure != null) {
                 for (ActiveTask task : tasks) {
                     final Exception failure = schedulingFailure == null
-                        ? new LeaseLostException("runtime stopped while processing task [" + task.taskId() + "]")
-                        : new LeaseLostException("could not schedule task queue maintenance", schedulingFailure);
+                        ? new IllegalStateException("runtime stopped while processing task [" + task.taskId() + "]")
+                        : new IllegalStateException("could not schedule task queue maintenance", schedulingFailure);
                     toCancel.add(new Tuple<>(task, failure));
                     if (schedulingFailure == null) {
                         toRelease.add(task.lease);
@@ -183,39 +182,22 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                             task.lease = renewedLease;
                             task.renewAtMillis = renewalTime(nowMillis, renewedLease.expiryMillis());
                             task.renewalInProgress = false;
-                            task.renewalRetryPending = false;
                             task.renewalResult = null;
-                        } else if (renewalFailure != null
-                            && renewalFailure instanceof LeaseLostException == false
-                            && nowMillis < task.lease.expiryMillis()) {
-                                final long normalRetryMillis = Math.max(1L, leaseDuration.millis() / 10L);
-                                final long remainingMillis = task.lease.expiryMillis() - nowMillis;
-                                task.renewAtMillis = nowMillis + Math.clamp(remainingMillis / 2L, 1L, normalRetryMillis);
-                                task.renewalInProgress = false;
-                                task.renewalRetryPending = true;
-                                task.renewalResult = null;
-                            } else {
-                                tasks.remove(i);
-                                nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
-                                final Exception failure;
-                                if (renewalFailure instanceof LeaseLostException) {
-                                    failure = renewalFailure;
-                                } else if (renewalFailure != null) {
-                                    failure = new LeaseLostException("lease for task [" + task.taskId() + "] has expired", renewalFailure);
-                                } else {
-                                    failure = new LeaseLostException(
-                                        "queue returned an invalid renewed lease for task [" + task.taskId() + "]"
-                                    );
-                                }
-                                toCancel.add(new Tuple<>(task, failure));
-                                continue;
-                            }
+                        } else {
+                            tasks.remove(i);
+                            nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
+                            final Exception failure = renewalFailure != null
+                                ? renewalFailure
+                                : new IllegalStateException("queue returned an invalid renewed lease for task [" + task.taskId() + "]");
+                            toCancel.add(new Tuple<>(task, failure));
+                            continue;
+                        }
                     }
 
                     if (nowMillis >= task.lease.expiryMillis()) {
                         tasks.remove(i);
                         nextClaimAtMillis = Math.min(nextClaimAtMillis, nowMillis);
-                        toCancel.add(new Tuple<>(task, new LeaseLostException("lease for task [" + task.taskId() + "] has expired")));
+                        toCancel.add(new Tuple<>(task, new IllegalStateException("lease for task [" + task.taskId() + "] has expired")));
                     } else if (task.renewalInProgress == false && nowMillis >= task.renewAtMillis) {
                         renewalDue = true;
                     }
@@ -224,11 +206,8 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 if (renewalDue) {
                     final long renewalCutoffMillis = nowMillis + renewalBatchWindowMillis;
                     for (ActiveTask task : tasks) {
-                        if (task.renewalInProgress == false
-                            && (task.renewAtMillis <= nowMillis
-                                || task.renewalRetryPending == false && task.renewAtMillis <= renewalCutoffMillis)) {
+                        if (task.renewalInProgress == false && task.renewAtMillis <= renewalCutoffMillis) {
                             task.renewalInProgress = true;
-                            task.renewalRetryPending = false;
                             toRenew.add(new Tuple<>(task, task.lease));
                         }
                     }
@@ -257,7 +236,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         }
 
         for (Tuple<ActiveTask, Exception> cancellation : toCancel) {
-            cancellation.v1().leaseLost(cancellation.v2());
+            cancellation.v1().cancel(cancellation.v2());
         }
         toRelease.forEach(this::release);
         if (toRenew.isEmpty() == false) {
@@ -358,7 +337,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
                 try {
                     previous.updateListener().onFailure(failure);
                 } catch (Exception e) {
-                    logger.warn(() -> "state-change listener failed while handling lease loss for task [" + task.taskId() + "]", e);
+                    logger.warn(() -> "state-change listener failed while cancelling task [" + task.taskId() + "]", e);
                 }
             }
         }
@@ -391,7 +370,6 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         // Accessed only by reconciliation under mutex.
         private long renewAtMillis;
         private boolean renewalInProgress;
-        private boolean renewalRetryPending;
         private Result<Lease, Exception> renewalResult;
 
         private ActiveTask(S state, Lease lease, long renewAtMillis) {
@@ -418,7 +396,7 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
         public void update(S newState, boolean terminal, ActionListener<S> listener) {
             final LocalState<S> current = localState.get();
             if (current.closed()) {
-                listener.onFailure(new LeaseLostException("lease for task [" + taskId + "] is no longer active"));
+                listener.onFailure(new IllegalStateException("lease for task [" + taskId + "] is no longer active"));
                 return;
             }
             if (current.updateListener() != null) {
@@ -430,21 +408,18 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             final LocalState<S> witness = localState.compareAndExchange(current, pendingUpdate);
             if (witness != current) {
                 final Exception failure = witness.closed()
-                    ? new LeaseLostException("lease for task [" + taskId + "] is no longer active")
+                    ? new IllegalStateException("lease for task [" + taskId + "] is no longer active")
                     : new IllegalStateException("task [" + taskId + "] changed concurrently while starting a persistent state change");
                 listener.onFailure(failure);
                 return;
             }
 
             final ActionListener<S> operationListener = ActionListener.assertOnce(
-                ActionListener.wrap(
-                    persistedState -> stateChangeCompleted(pendingUpdate, persistedState),
-                    failure -> stateChangeFailed(pendingUpdate, failure)
-                )
+                ActionListener.wrap(persistedState -> stateChangeCompleted(pendingUpdate, persistedState), this::stateChangeFailed)
             );
             final Lease lease = this.lease;
             if (threadPool.absoluteTimeInMillis() >= lease.expiryMillis()) {
-                operationListener.onFailure(new LeaseLostException("lease for task [" + taskId + "] has expired"));
+                operationListener.onFailure(new IllegalStateException("lease for task [" + taskId + "] has expired"));
             } else {
                 queue.update(lease, newState, terminal, operationListener);
             }
@@ -462,24 +437,16 @@ public final class TaskProcessorRuntime<S> extends AbstractLifecycleComponent {
             pendingUpdate.updateListener().onResponse(persistedState);
         }
 
-        private void stateChangeFailed(LocalState<S> pendingUpdate, Exception failure) {
-            if (failure instanceof LeaseLostException) {
-                leaseLost(failure);
-                return;
-            }
-
-            final LocalState<S> failed = new LocalState<>(pendingUpdate.state(), false, false, null);
-            if (localState.compareAndSet(pendingUpdate, failed)) {
-                pendingUpdate.updateListener().onFailure(failure);
-            }
+        private void stateChangeFailed(Exception failure) {
+            cancel(failure);
         }
 
         private void processorFailed(Exception failure) {
             logger.warn(() -> "task processor failed unexpectedly for task [" + taskId + "]", failure);
-            leaseLost(new LeaseLostException("task processor failed for task [" + taskId + "]", failure));
+            cancel(new IllegalStateException("task processor failed for task [" + taskId + "]", failure));
         }
 
-        private void leaseLost(Exception failure) {
+        private void cancel(Exception failure) {
             closeAndCancel(this, failure);
             reconcile(null, null, null);
         }

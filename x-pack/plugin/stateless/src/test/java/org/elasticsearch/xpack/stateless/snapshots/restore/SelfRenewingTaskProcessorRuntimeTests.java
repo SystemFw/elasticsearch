@@ -15,7 +15,6 @@ import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.stateless.snapshots.restore.Task.TaskHandle;
 import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.Lease;
-import org.elasticsearch.xpack.stateless.snapshots.restore.TaskQueue.LeaseLostException;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -66,6 +65,30 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         var finalResult = new AtomicReference<String>();
         execution.update("finished", true, ActionListener.wrap(finalResult::set, e -> fail(e.getMessage())));
         assertThat(finalResult.get(), equalTo("finished"));
+        assertThat(runtime.activeTaskCount(), equalTo(0));
+
+        runtime.stop();
+        runtime.close();
+    }
+
+    public void testUpdateFailureCancelsTask() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        queue.failUpdates = true;
+        var executionRef = new AtomicReference<TaskHandle<String>>();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
+
+        runtime.start();
+        deterministicTaskQueue.runAllRunnableTasks();
+
+        var updateFailure = new AtomicReference<Exception>();
+        executionRef.get()
+            .update("modified", false, ActionListener.wrap(ignored -> fail("update unexpectedly succeeded"), updateFailure::set));
+
+        assertSame(queue.updateFailure, updateFailure.get());
+        assertSame(executionRef.get(), cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
         runtime.stop();
@@ -156,12 +179,33 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
-    public void testFencedRenewalFailsPendingStateChange() {
+    public void testRenewalFailureCancelsTask() {
+        var deterministicTaskQueue = new DeterministicTaskQueue();
+        var queue = new TestTaskQueue(deterministicTaskQueue);
+        queue.add("task", "initial");
+        queue.failRenewals = true;
+        var executionRef = new AtomicReference<TaskHandle<String>>();
+        var cancelledTask = new AtomicReference<TaskHandle<String>>();
+        var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
+
+        runtime.start();
+        deterministicTaskQueue.runAllRunnableTasks();
+        deterministicTaskQueue.advanceTime();
+        deterministicTaskQueue.runAllRunnableTasks();
+
+        assertSame(executionRef.get(), cancelledTask.get());
+        assertThat(runtime.activeTaskCount(), equalTo(0));
+
+        runtime.stop();
+        runtime.close();
+    }
+
+    public void testRenewalFailureFailsPendingStateChange() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
         queue.deferModifications = true;
-        queue.failRenewalsWithLeaseLoss = true;
+        queue.failRenewals = true;
         var executionRef = new AtomicReference<TaskHandle<String>>();
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
@@ -179,7 +223,7 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
 
-        assertThat(stateChangeFailure.get(), instanceOf(LeaseLostException.class));
+        assertSame(queue.renewalFailure, stateChangeFailure.get());
         assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
@@ -187,12 +231,12 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         runtime.close();
     }
 
-    public void testFencedRenewalFailsPendingFinishImmediately() {
+    public void testRenewalFailureFailsPendingFinishImmediately() {
         var deterministicTaskQueue = new DeterministicTaskQueue();
         var queue = new TestTaskQueue(deterministicTaskQueue);
         queue.add("task", "initial");
         queue.deferFinishes = true;
-        queue.failRenewalsWithLeaseLoss = true;
+        queue.failRenewals = true;
         var executionRef = new AtomicReference<TaskHandle<String>>();
         var cancelledTask = new AtomicReference<TaskHandle<String>>();
         var runtime = newRuntime(deterministicTaskQueue, queue, processor(executionRef::set, cancelledTask::set));
@@ -205,11 +249,11 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
 
         deterministicTaskQueue.advanceTime();
         deterministicTaskQueue.runAllRunnableTasks();
-        assertThat(finishFailure.get(), instanceOf(LeaseLostException.class));
+        assertSame(queue.renewalFailure, finishFailure.get());
         assertSame(execution, cancelledTask.get());
         assertThat(runtime.activeTaskCount(), equalTo(0));
 
-        // The queue operation may still have committed even though its successful response arrived after lease loss.
+        // The queue operation may still have committed even though its successful response arrived after cancellation.
         queue.completeFinish();
         assertThat(queue.states.get("task"), equalTo("finished"));
 
@@ -317,7 +361,10 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         private boolean deferModifications;
         private boolean deferFinishes;
         private boolean completeRenewals = true;
-        private boolean failRenewalsWithLeaseLoss;
+        private boolean failRenewals;
+        private boolean failUpdates;
+        private final RuntimeException renewalFailure = new RuntimeException("simulated renewal failure");
+        private final RuntimeException updateFailure = new RuntimeException("simulated update failure");
         private ActionListener<List<Tuple<String, Lease>>> pendingClaim;
         private PendingModification pendingModification;
         private PendingModification pendingFinish;
@@ -367,8 +414,8 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         public void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener) {
             singleRenewCount++;
             renewedLeases.add(lease);
-            if (failRenewalsWithLeaseLoss) {
-                listener.onFailure(new LeaseLostException("simulated fencing"));
+            if (failRenewals) {
+                listener.onFailure(renewalFailure);
             } else if (completeRenewals) {
                 listener.onResponse(
                     new Lease(
@@ -385,10 +432,8 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
         public void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener) {
             bulkRenewCount++;
             renewedLeases.addAll(leases);
-            if (failRenewalsWithLeaseLoss) {
-                listener.onResponse(
-                    leases.stream().map(ignored -> Result.<Lease, Exception>failure(new LeaseLostException("simulated fencing"))).toList()
-                );
+            if (failRenewals) {
+                listener.onResponse(leases.stream().map(ignored -> Result.<Lease, Exception>failure(renewalFailure)).toList());
             } else if (completeRenewals) {
                 listener.onResponse(
                     leases.stream()
@@ -409,7 +454,9 @@ public class SelfRenewingTaskProcessorRuntimeTests extends ESTestCase {
 
         @Override
         public void update(Lease lease, String newState, boolean terminal, ActionListener<String> listener) {
-            if (terminal) {
+            if (failUpdates) {
+                listener.onFailure(updateFailure);
+            } else if (terminal) {
                 if (deferFinishes) {
                     assertNull(pendingFinish);
                     pendingFinish = new PendingModification(lease.taskId(), newState, listener);

@@ -35,33 +35,28 @@ public interface TaskQueue<S> {
      */
     record Lease(String taskId, String ownerId, long fencingToken, long expiryMillis) {}
 
-    /** Indicates that an operation was rejected because its lease no longer owns the task. */
-    class LeaseLostException extends RuntimeException {
-
-        /** Creates an exception describing why the lease no longer grants authority. */
-        public LeaseLostException(String message) {
-            super(message);
-        }
-
-        /** Creates an exception describing why the lease no longer grants authority. */
-        public LeaseLostException(String message, Throwable cause) {
-            super(message, cause);
-        }
-    }
-
     /** Claims up to {@code maxTasks} available tasks for {@code ownerId}, replacing any expired leases. */
     void claim(String ownerId, int maxTasks, TimeValue leaseDuration, ActionListener<List<Tuple<S, Lease>>> listener);
 
-    /** Renews a live lease and returns the renewed lease. */
+    /**
+     * Renews a live lease and returns the renewed lease. The queue owns any retries for transient failures; callers treat a reported
+     * failure as final.
+     */
     void renew(Lease lease, TimeValue leaseDuration, ActionListener<Lease> listener);
 
     /**
      * Renews live leases in bulk. The response must contain one result per input lease, in the same order. A request-level failure is
-     * reported to {@code listener}; failures affecting individual leases are returned as item results.
+     * reported to {@code listener}; failures affecting individual leases are returned as item results. The queue owns any retries for
+     * transient failures and callers treat reported failures as final. Internal retries must not hold successful item results until their
+     * previously known leases expire: unresolved items must be returned as failures early enough for the caller to process successful
+     * renewals before the earliest input lease expires.
      */
     void renew(List<Lease> leases, TimeValue leaseDuration, ActionListener<List<Result<Lease, Exception>>> listener);
 
-    /** Replaces the task-specific persistent state, optionally making the task terminal and removing its lease. */
+    /**
+     * Replaces the task-specific persistent state, optionally making the task terminal and removing its lease. The queue owns any retries
+     * for transient failures; callers treat a reported failure as final and stop processing the task.
+     */
     void update(Lease lease, S newState, boolean terminal, ActionListener<S> listener);
 
     /**
