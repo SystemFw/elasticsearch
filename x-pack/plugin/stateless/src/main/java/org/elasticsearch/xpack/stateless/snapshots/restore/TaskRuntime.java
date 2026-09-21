@@ -123,7 +123,7 @@ public abstract class TaskRuntime<S> {
             running = false;
             claimPoller.cancel();
             for (var task : List.copyOf(activeTasks)) {
-                task.stopAndRelease();
+                task.cancel(true);
             }
         }
     }
@@ -139,27 +139,39 @@ public abstract class TaskRuntime<S> {
             return;
         }
 
-        queue.claim(workerId, capacity, leaseDuration, new ActionListener<>() {
+        final ActionListener<List<Tuple<S, Lease>>> listener = ActionListener.assertOnce(new ActionListener<>() {
             @Override
             public void onResponse(List<Tuple<S, Lease>> claimedTasks) {
                 synchronized (mutex) {
-                    for (var claimedTask : claimedTasks) {
-                        var lease = claimedTask.v1();
-                        if (running) {
-                            var task = null; // start task
-                            activeTasks.add(task);
-
+                    try {
+                        final long nowMillis = threadPool.absoluteTimeInMillis();
+                        for (Tuple<S, Lease> claimedTask : claimedTasks) {
+                            final Lease lease = claimedTask.v2();
+                            if (running == false || lease.expiryMillis() <= nowMillis) {
+                                release(lease);
+                                continue;
+                            }
+                            new ActiveTask().start(lease, claimedTask.v1());
                         }
+                    } finally {
+                        claimInProgress.set(false);
                     }
-                    claimInProgress.set(false);
                 }
             }
 
             @Override
             public void onFailure(Exception e) {
                 claimInProgress.set(false);
+                if (running) {
+                    logger.debug("failed to claim queued tasks", e);
+                }
             }
         });
+        try {
+            queue.claim(workerId, capacity, leaseDuration, listener);
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
     }
 
     private void release(Lease lease) {
@@ -226,6 +238,7 @@ public abstract class TaskRuntime<S> {
                         executor.execute(() -> task.process(handle));
 
                         status = Status.STARTED;
+                        activeTasks.add(this);
                         finalizers.clear();
                     } catch (Exception e) {
                         failure = e;
@@ -296,10 +309,6 @@ public abstract class TaskRuntime<S> {
                     throw new UnsupportedOperationException("handle update not implemented");
                 }
             };
-        }
-
-        private void stopAndRelease() {
-            cancel(true);
         }
     }
 }
