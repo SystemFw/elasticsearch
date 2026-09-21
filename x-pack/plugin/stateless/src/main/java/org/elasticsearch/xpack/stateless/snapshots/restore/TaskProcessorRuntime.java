@@ -403,6 +403,7 @@ public abstract class TaskProcessorRuntime<S> {
             //    the lease explicitly. It adds some extra calls but it's less risky. It also doesn't cover the case where the task is done,
             //    maybe that should be up to each task, and claim should take a query. EDIT: risk is overstated perhaps,
             //    claim will not select that task
+            //  - the Task api should slight change: protected method to create a Task, mandate cheap constructor
             final LocalState<S> current = localState.get();
             if (current.closed()) {
                 listener.onFailure(new InterruptedException());
