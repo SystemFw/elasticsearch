@@ -395,6 +395,14 @@ public abstract class TaskProcessorRuntime<S> {
             //  - have to figure out populating the closed and terminal
             //  - cancel should take no args
             //  - if update fails, don't call the listener at all, just cancel
+            //  - I'm thinking of changing cancel to close(boolean cancelled), and use it for completion as well
+            //  - and maybe we should stipulate that process doesn't throw. Gets cancelled if it does
+            //  - still open-ended if we should bother having update renew the lease as well. It's currently not avoiding a periodic
+            //    renewal anyway, and in the two concrete use cases it would not make a difference.
+            //  - and then terminal is weird, cause you can continue executing after. Perhaps you should just throw or complete to release
+            //    the lease explicitly. It adds some extra calls but it's less risky. It also doesn't cover the case where the task is done,
+            //    maybe that should be up to each task, and claim should take a query. EDIT: risk is overstated perhaps,
+            //    claim will not select that task
             final LocalState<S> current = localState.get();
             if (current.closed()) {
                 listener.onFailure(new InterruptedException());
