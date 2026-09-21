@@ -192,76 +192,95 @@ public abstract class TaskRuntime<S> {
         private void start(Lease lease, S initialState) {
             final List<Runnable> finalizers = new ArrayList<>();
             final boolean releaseLease;
+            Exception failure = null;
             synchronized (mutex) {
                 if (status == Status.DONE) {
                     releaseLease = true;
                 } else if (status != Status.NEW) {
                     return;
                 } else {
+                    releaseLease = false;
                     try {
                         this.lease = lease;
+                        finalizers.add(() -> cancel(true));
                         this.task = taskInstance();
-                        finalizers.add(() -> task.close(true));
 
-                        this.renewalTimer = scheduleRenewalTimer();
-                        finalizers.add(() -> renewalTimer.cancel());
+                        final long remainingMillis = lease.expiryMillis() - threadPool.absoluteTimeInMillis();
+                        if (remainingMillis <= 0L) {
+                            throw new IllegalStateException();
+                        }
 
-                        this.expiryTimer = scheduleExpiryTimer();
-                        finalizers.add(() -> expiryTimer.cancel());
+                        this.renewalTimer = threadPool.schedule(
+                            this::onRenewalTimer,
+                            TimeValue.timeValueMillis(Math.max(1L, remainingMillis / 2L)),
+                            threadPool.generic()
+                        );
+
+                        this.expiryTimer = threadPool.schedule(
+                            this::onExpiryTimer,
+                            TimeValue.timeValueMillis(remainingMillis),
+                            threadPool.generic()
+                        );
 
                         this.handle = stubHandle(initialState);
                         executor.execute(() -> task.process(handle));
 
                         status = Status.STARTED;
                         finalizers.clear();
-                        releaseLease = false;
                     } catch (Exception e) {
-                        for (int i = finalizers.size() - 1; i >= 0; i--) {
-                            try {
-                                finalizers.get(i).run();
-                            } catch (Exception suppressed) {
-                                e.addSuppressed(suppressed);
-                            }
-                        }
-                        status = Status.DONE;
-                        logger.debug(() -> "failed to start task [" + lease.taskId() + "]", e);
-                        releaseLease = true;
+                        failure = e;
                     }
                 }
+            }
+            if (failure != null) {
+                for (int i = finalizers.size() - 1; i >= 0; i--) {
+                    try {
+                        finalizers.get(i).run();
+                    } catch (Exception suppressed) {
+                        failure.addSuppressed(suppressed);
+                    }
+                }
+                logger.debug(() -> "failed to start task [" + lease.taskId() + "]", failure);
             }
             if (releaseLease) {
                 release(lease);
             }
         }
 
-        private Scheduler.Cancellable scheduleRenewalTimer() {
-            // TODO: schedule lease renewal
-            return new Scheduler.Cancellable() {
-                @Override
-                public boolean cancel() {
-                    return false;
+        private void cancel(boolean releaseLease) {
+            final boolean closeTask;
+            synchronized (mutex) {
+                if (status == Status.DONE) {
+                    return;
                 }
-
-                @Override
-                public boolean isCancelled() {
-                    return false;
+                closeTask = status == Status.STARTED;
+                status = Status.DONE;
+            }
+            if (renewalTimer != null) {
+                renewalTimer.cancel();
+            }
+            if (expiryTimer != null) {
+                expiryTimer.cancel();
+            }
+            if (closeTask) {
+                try {
+                    task.close(true);
+                } catch (Exception e) {
+                    logger.warn(() -> "failed to close task [" + lease.taskId() + "]", e);
                 }
-            };
+            }
+            activeTasks.remove(this);
+            if (releaseLease) {
+                release(lease);
+            }
         }
 
-        private Scheduler.Cancellable scheduleExpiryTimer() {
-            // TODO: schedule lease expiry
-            return new Scheduler.Cancellable() {
-                @Override
-                public boolean cancel() {
-                    return false;
-                }
+        private void onRenewalTimer() {
+            // TODO
+        }
 
-                @Override
-                public boolean isCancelled() {
-                    return false;
-                }
-            };
+        private void onExpiryTimer() {
+            cancel(false);
         }
 
         private Handle<S> stubHandle(S initialState) {
@@ -280,7 +299,7 @@ public abstract class TaskRuntime<S> {
         }
 
         private void stopAndRelease() {
-            // TODO
+            cancel(true);
         }
     }
 }
