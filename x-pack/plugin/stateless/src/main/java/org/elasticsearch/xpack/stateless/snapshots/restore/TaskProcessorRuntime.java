@@ -384,6 +384,17 @@ public abstract class TaskProcessorRuntime<S> {
 
         @Override
         public void update(S newState, boolean terminal, ActionListener<S> listener) {
+            // TODO here:
+            //  - remove defensive check on concurrent update
+            //  - the listener should be passed around, not put in state
+            //  - can remove that compare and exchange
+            //  - terminal should not be set until success
+            //  - the wrap etc is pointless
+            //  - the lease check can happen earlier, and should call cancel
+            //  - once inlined, the two listeners can probably be simplified further, dont' have to CAS to get the update listener
+            //  - have to figure out populating the closed and terminal
+            //  - cancel should take no args
+            //  - if update fails, don't call the listener at all, just cancel
             final LocalState<S> current = localState.get();
             if (current.closed()) {
                 listener.onFailure(new InterruptedException());
