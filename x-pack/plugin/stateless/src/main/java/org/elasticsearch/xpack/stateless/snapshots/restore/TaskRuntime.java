@@ -139,23 +139,20 @@ public abstract class TaskRuntime<S> {
             return;
         }
 
-        final ActionListener<List<Tuple<S, Lease>>> listener = ActionListener.assertOnce(new ActionListener<>() {
+        queue.claim(workerId, capacity, leaseDuration, ActionListener.assertOnce(new ActionListener<>() {
             @Override
             public void onResponse(List<Tuple<S, Lease>> claimedTasks) {
                 synchronized (mutex) {
-                    try {
-                        final long nowMillis = threadPool.absoluteTimeInMillis();
-                        for (Tuple<S, Lease> claimedTask : claimedTasks) {
-                            final Lease lease = claimedTask.v2();
-                            if (running == false || lease.expiryMillis() <= nowMillis) {
-                                release(lease);
-                                continue;
-                            }
-                            new ActiveTask().start(lease, claimedTask.v1());
+                    final long nowMillis = threadPool.absoluteTimeInMillis();
+                    for (Tuple<S, Lease> claimedTask : claimedTasks) {
+                        final Lease lease = claimedTask.v2();
+                        if (running == false || lease.expiryMillis() <= nowMillis) {
+                            release(lease);
+                            continue;
                         }
-                    } finally {
-                        claimInProgress.set(false);
+                        new ActiveTask().start(lease, claimedTask.v1());
                     }
+                    claimInProgress.set(false);
                 }
             }
 
@@ -166,24 +163,17 @@ public abstract class TaskRuntime<S> {
                     logger.debug("failed to claim queued tasks", e);
                 }
             }
-        });
-        try {
-            queue.claim(workerId, capacity, leaseDuration, listener);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
+        }));
     }
 
     private void release(Lease lease) {
-        final ActionListener<Void> listener = ActionListener.wrap(
-            ignored -> {},
-            failure -> logger.debug(() -> "failed to release lease for task [" + lease.taskId() + "]", failure)
+        queue.release(
+            lease,
+            ActionListener.wrap(
+                ignored -> {},
+                failure -> logger.debug(() -> "failed to release lease for task [" + lease.taskId() + "]", failure)
+            )
         );
-        try {
-            queue.release(lease, listener);
-        } catch (Exception e) {
-            listener.onFailure(e);
-        }
     }
 
     private class ActiveTask {
@@ -312,4 +302,3 @@ public abstract class TaskRuntime<S> {
         }
     }
 }
-
