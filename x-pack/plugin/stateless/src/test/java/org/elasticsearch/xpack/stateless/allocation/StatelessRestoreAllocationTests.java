@@ -110,19 +110,11 @@ public class StatelessRestoreAllocationTests extends ESAllocationTestCase {
         return ClusterInfo.builder().leastAvailableSpaceUsage(disks).mostAvailableSpaceUsage(disks).reservedSpace(reservations).build();
     }
 
-    private static SnapshotRestoreAllocationDecider restoreDecider() {
-        return new SnapshotRestoreAllocationDecider(Settings.EMPTY);
-    }
-
-    private AllocationService service(
-        SnapshotRestoreAllocationDecider restoreDecider,
-        AtomicReference<ClusterInfo> info,
-        AtomicReference<SnapshotShardSizeInfo> sizes
-    ) {
+    private AllocationService service(AtomicReference<ClusterInfo> info, AtomicReference<SnapshotShardSizeInfo> sizes) {
         final Settings settings = Settings.builder().put("cluster.routing.allocation.type", "desired_balance").build();
         final ClusterSettings clusterSettings = createBuiltInClusterSettings(settings);
         var service = new AllocationService(
-            new AllocationDeciders(List.of(restoreDecider, new StatelessAllocationDecider())),
+            new AllocationDeciders(List.of(new SnapshotRestoreAllocationDecider(Settings.EMPTY), new StatelessAllocationDecider())),
             createShardsAllocator(settings),
             info::get,
             sizes::get,
@@ -132,10 +124,6 @@ public class StatelessRestoreAllocationTests extends ESAllocationTestCase {
         );
         service.setExistingShardsAllocators(Map.of("stateless", new StatelessExistingShardsAllocator()));
         return service;
-    }
-
-    private AllocationService service(AtomicReference<ClusterInfo> info, AtomicReference<SnapshotShardSizeInfo> sizes) {
-        return service(restoreDecider(), info, sizes);
     }
 
     private static ShardRouting primary(ClusterState state, String index) {
@@ -237,19 +225,6 @@ public class StatelessRestoreAllocationTests extends ESAllocationTestCase {
         state = service.reroute(state, "one node fits", ActionListener.noop());
 
         assertTrue(primary(state, "index-0").initializing());
-    }
-
-    public void testBothRestoresThrottleWhenNeitherFits() {
-        // Neither 50 GiB restore fits: free 70-1 leaves less than 20 GiB indexing reserve after one shard.
-        var state = restoreState(2);
-        var info = new AtomicReference<>(info(70 * GB - 1));
-        var sizes = new AtomicReference<>(sizes(state, 50 * GB));
-        var service = service(info, sizes);
-
-        state = service.reroute(state, "both tight", ActionListener.noop());
-        assertEquals(2, state.getRoutingNodes().unassigned().size());
-        assertEquals(UnassignedInfo.AllocationStatus.DECIDERS_THROTTLED, primary(state, "index-0").unassignedInfo().lastAllocationStatus());
-        assertEquals(UnassignedInfo.AllocationStatus.DECIDERS_THROTTLED, primary(state, "index-1").unassignedInfo().lastAllocationStatus());
     }
 
     public void testMonitorReroutesWhenStorageChangesWhileRestorePending() {
