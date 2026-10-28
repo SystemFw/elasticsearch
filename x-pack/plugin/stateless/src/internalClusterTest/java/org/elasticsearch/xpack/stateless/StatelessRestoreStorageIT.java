@@ -35,7 +35,7 @@ public class StatelessRestoreStorageIT extends AbstractStatelessPluginIntegTestC
 
     public void testRestoreResumesAfterDiskCapacityAppears() throws Exception {
         var master = startMasterOnlyNode();
-        startIndexNode();
+        var indexNode = startIndexNode();
         startSearchNode();
         createIndex("source", indexSettings(1, 1).build());
         ensureGreen("source");
@@ -46,9 +46,12 @@ public class StatelessRestoreStorageIT extends AbstractStatelessPluginIntegTestC
         assertAcked(indicesAdmin().prepareDelete("source"));
 
         var infoService = (MockInternalClusterInfoService) internalCluster().getInstance(ClusterInfoService.class, master);
-        infoService.setDiskUsageFunctionAndRefresh(
-            (node, path) -> new FsInfo.Path(path.getPath(), path.getMount(), ByteSizeValue.ofGb(100).getBytes(), 0L, 0L)
-        );
+        // A stays too small to admit the restore; any other index node reports enough free space.
+        infoService.setDiskUsageFunctionAndRefresh((node, path) -> {
+            long total = ByteSizeValue.ofGb(100).getBytes();
+            long free = indexNode.equals(node.getName()) ? ByteSizeValue.ofMb(1).getBytes() : ByteSizeValue.ofGb(90).getBytes();
+            return new FsInfo.Path(path.getPath(), path.getMount(), total, free, free);
+        });
         clusterAdmin().prepareRestoreSnapshot(TEST_REQUEST_TIMEOUT, "repo", "snapshot").setWaitForCompletion(false).get();
 
         assertBusy(() -> {
@@ -73,16 +76,10 @@ public class StatelessRestoreStorageIT extends AbstractStatelessPluginIntegTestC
             );
         });
 
-        // Publishing capacity must be enough: no manual reroute or second restore request.
-        infoService.setDiskUsageFunctionAndRefresh(
-            (node, path) -> new FsInfo.Path(
-                path.getPath(),
-                path.getMount(),
-                ByteSizeValue.ofGb(100).getBytes(),
-                ByteSizeValue.ofGb(90).getBytes(),
-                ByteSizeValue.ofGb(90).getBytes()
-            )
-        );
+        startIndexNode();
+        internalCluster().stopNode(indexNode);
+
+        // No manual reroute or second restore request.
         assertBusy(
             () -> assertTrue(
                 clusterAdmin().prepareState(TEST_REQUEST_TIMEOUT)
