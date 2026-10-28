@@ -35,7 +35,7 @@ public class StatelessRestoreStorageIT extends AbstractStatelessPluginIntegTestC
 
     public void testRestoreResumesAfterDiskCapacityAppears() throws Exception {
         var master = startMasterOnlyNode();
-        var indexNode = startIndexNode();
+        var smallNode = startIndexNode();
         startSearchNode();
         createIndex("source", indexSettings(1, 1).build());
         ensureGreen("source");
@@ -46,11 +46,10 @@ public class StatelessRestoreStorageIT extends AbstractStatelessPluginIntegTestC
         assertAcked(indicesAdmin().prepareDelete("source"));
 
         var infoService = (MockInternalClusterInfoService) internalCluster().getInstance(ClusterInfoService.class, master);
-        // A stays too small to admit the restore; any other index node reports enough free space.
+        // Simulate a small index node vs a large one (both mostly empty). The small node cannot admit the restore.
         infoService.setDiskUsageFunctionAndRefresh((node, path) -> {
-            long total = ByteSizeValue.ofGb(100).getBytes();
-            long free = indexNode.equals(node.getName()) ? ByteSizeValue.ofMb(1).getBytes() : ByteSizeValue.ofGb(90).getBytes();
-            return new FsInfo.Path(path.getPath(), path.getMount(), total, free, free);
+            long total = node.getName().equals(smallNode) ? ByteSizeValue.ofKb(1).getBytes() : ByteSizeValue.ofGb(100).getBytes();
+            return new FsInfo.Path(path.getPath(), path.getMount(), total, total, total);
         });
         clusterAdmin().prepareRestoreSnapshot(TEST_REQUEST_TIMEOUT, "repo", "snapshot").setWaitForCompletion(false).get();
 
@@ -69,15 +68,15 @@ public class StatelessRestoreStorageIT extends AbstractStatelessPluginIntegTestC
                             .getDecisions()
                             .stream()
                             .anyMatch(
-                                decision -> "stateless_snapshot_restore_storage".equals(decision.label())
-                                    && decision.type() == Decision.Type.THROTTLE
+                                decision -> decision.type() == Decision.Type.THROTTLE
+                                    && decision.label().equals("stateless_snapshot_restore_storage")
                             )
                     )
             );
         });
 
         startIndexNode();
-        internalCluster().stopNode(indexNode);
+        internalCluster().stopNode(smallNode);
 
         // No manual reroute or second restore request.
         assertBusy(
