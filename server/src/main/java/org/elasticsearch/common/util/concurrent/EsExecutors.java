@@ -26,6 +26,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.ScheduledExecutorService;
@@ -330,6 +331,13 @@ public class EsExecutors {
      * shutdown.
      */
     public static final ExecutorService DIRECT_EXECUTOR_SERVICE = new DirectExecutorService();
+
+    /**
+     * {@link ExecutorService} that runs each task on a new virtual thread. Use as the {@code executor} for a
+     * {@code TransportAction} that implements {@code doExecuteBlocking} instead of the listener-based {@code doExecute}.
+     * Do not shut this executor down; it is a process-wide singleton.
+     */
+    public static final ExecutorService VIRTUAL_THREAD_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
     public static String threadName(Settings settings, String executorName) {
         // TODO require node name to be non empty unless in tests

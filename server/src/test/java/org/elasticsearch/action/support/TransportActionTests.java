@@ -131,6 +131,35 @@ public class TransportActionTests extends ESTestCase {
         assertThat(response.executingThreadId, equalTo(Thread.currentThread().getId()));
     }
 
+    public void testExecuteWithVirtualThreadExecutorRunsDoExecuteBlocking() throws Exception {
+        String actionName = randomAlphaOfLength(randomInt(30));
+        var transportAction = getBlockingTestTransportAction(actionName);
+
+        PlainActionFuture<TestResponse> future = new PlainActionFuture<>();
+        ActionTestUtils.execute(transportAction, null, new TestRequest(), future);
+
+        var response = future.get();
+        assertThat(response, notNullValue());
+        assertTrue(response.executingThreadIsVirtual);
+    }
+
+    public void testVirtualThreadExecutorWithoutDoExecuteBlockingFails() {
+        String actionName = randomAlphaOfLength(randomInt(30));
+        TransportAction<TestRequest, TestResponse> transportAction = new TransportAction<>(
+            actionName,
+            ActionFilters.EMPTY,
+            new TaskManager(Settings.EMPTY, threadPool, Collections.emptySet()),
+            EsExecutors.VIRTUAL_THREAD_EXECUTOR
+        ) {
+        };
+
+        PlainActionFuture<TestResponse> future = new PlainActionFuture<>();
+        ActionTestUtils.execute(transportAction, null, new TestRequest(), future);
+
+        var e = expectThrows(ExecutionException.class, future::get);
+        assertThat(e.getCause().getMessage(), containsString("must override doExecuteBlocking"));
+    }
+
     private TransportAction<TestRequest, TestResponse> getTestTransportAction(String actionName, Executor executor) {
         ActionFilters actionFilters = ActionFilters.EMPTY;
         TransportAction<TestRequest, TestResponse> transportAction = new TransportAction<>(
@@ -141,10 +170,24 @@ public class TransportActionTests extends ESTestCase {
         ) {
             @Override
             protected void doExecute(Task task, TestRequest request, ActionListener<TestResponse> listener) {
-                listener.onResponse(new TestResponse(Thread.currentThread().getName(), Thread.currentThread().getId()));
+                listener.onResponse(new TestResponse(Thread.currentThread()));
             }
         };
         return transportAction;
+    }
+
+    private TransportAction<TestRequest, TestResponse> getBlockingTestTransportAction(String actionName) {
+        return new TransportAction<>(
+            actionName,
+            ActionFilters.EMPTY,
+            new TaskManager(Settings.EMPTY, threadPool, Collections.emptySet()),
+            EsExecutors.VIRTUAL_THREAD_EXECUTOR
+        ) {
+            @Override
+            protected TestResponse doExecuteBlocking(Task task, TestRequest request) {
+                return new TestResponse(Thread.currentThread());
+            }
+        };
     }
 
     private static class TestRequest extends UntypedActionRequest {
@@ -158,10 +201,12 @@ public class TransportActionTests extends ESTestCase {
 
         private final String executingThreadName;
         private final long executingThreadId;
+        private final boolean executingThreadIsVirtual;
 
-        TestResponse(String executingThreadName, long executingThreadId) {
-            this.executingThreadName = executingThreadName;
-            this.executingThreadId = executingThreadId;
+        TestResponse(Thread executingThread) {
+            this.executingThreadName = executingThread.getName();
+            this.executingThreadId = executingThread.getId();
+            this.executingThreadIsVirtual = executingThread.isVirtual();
         }
 
         @Override

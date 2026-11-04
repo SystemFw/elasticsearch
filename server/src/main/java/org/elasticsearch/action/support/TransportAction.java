@@ -49,10 +49,17 @@ public abstract class TransportAction<Request extends ActionRequest, Response ex
     }
 
     /**
-     * Use this method when the transport action should continue to run in the context of the current task
+     * Use this method when the transport action should continue to run in the context of the current task.
+     * For {@link EsExecutors#VIRTUAL_THREAD_EXECUTOR} actions this still forks onto a virtual thread so the
+     * blocking body never runs on the caller (e.g. a Netty event loop).
      */
     protected final void executeDirect(Task task, Request request, ActionListener<Response> listener) {
-        handleExecution(task, request, listener, this::doExecute);
+        handleExecution(
+            task,
+            request,
+            listener,
+            executor == EsExecutors.VIRTUAL_THREAD_EXECUTOR ? this::doExecuteForking : this::doExecute
+        );
     }
 
     public final void execute(Task task, Request request, ActionListener<Response> listener) {
@@ -96,11 +103,46 @@ public abstract class TransportAction<Request extends ActionRequest, Response ex
         requestFilterChain.proceed(task, actionName, request, ActionListener.runBefore(listener, releaseRef::close));
     }
 
+    /**
+     * Runs the action body on {@link #executor} (used when that executor is not {@link EsExecutors#DIRECT_EXECUTOR_SERVICE}).
+     */
     private void doExecuteForking(Task task, Request request, ActionListener<Response> listener) {
-        executor.execute(ActionRunnable.wrap(listener, l -> doExecute(task, request, listener)));
+        if (executor == EsExecutors.VIRTUAL_THREAD_EXECUTOR) {
+            executor.execute(ActionRunnable.supply(listener, () -> doExecuteBlocking(task, request)));
+        } else {
+            executor.execute(ActionRunnable.wrap(listener, l -> doExecute(task, request, listener)));
+        }
     }
 
-    protected abstract void doExecute(Task task, Request request, ActionListener<Response> listener);
+    private void dispatchExecute(Task task, Request request, ActionListener<Response> listener) {
+        if (executor == EsExecutors.VIRTUAL_THREAD_EXECUTOR) {
+            assert Thread.currentThread().isVirtual() : "blocking transport action body must run on a virtual thread";
+            ActionListener.completeWith(listener, () -> doExecuteBlocking(task, request));
+        } else {
+            doExecute(task, request, listener);
+        }
+    }
+
+    /**
+     * Listener-based execution entry point for actions that use a platform-thread or {@link EsExecutors#DIRECT_EXECUTOR_SERVICE}
+     * executor. Actions constructed with {@link EsExecutors#VIRTUAL_THREAD_EXECUTOR} must override {@link #doExecuteBlocking} instead;
+     * this method is not invoked for those actions.
+     */
+    protected void doExecute(Task task, Request request, ActionListener<Response> listener) {
+        assert executor != EsExecutors.VIRTUAL_THREAD_EXECUTOR;
+        throw new UnsupportedOperationException(getClass().getName() + " must override doExecute");
+    }
+
+    /**
+     * Blocking execution entry point for actions constructed with {@link EsExecutors#VIRTUAL_THREAD_EXECUTOR}.
+     * May block or wait on the calling virtual thread. The framework completes the transport listener with the returned response
+     * or thrown exception. Actions that use any other executor must override {@link #doExecute} instead; this method is not invoked
+     * for those actions.
+     */
+    protected Response doExecuteBlocking(Task task, Request request) throws Exception {
+        assert executor == EsExecutors.VIRTUAL_THREAD_EXECUTOR;
+        throw new UnsupportedOperationException(getClass().getName() + " must override doExecuteBlocking");
+    }
 
     private static class RequestFilterChain<Request extends ActionRequest, Response extends ActionResponse>
         implements
